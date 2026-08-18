@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -11,8 +12,10 @@ import (
 )
 
 var (
-	testProxyHost  = "127.0.0.1:9090"
-	testRemoteHost = "127.0.0.1:5432"
+	testProxyHost    = "127.0.0.1:9090"
+	testRemoteHost   = "127.0.0.1:5432"
+	testBenchmarkHost = "127.0.0.1:9092"
+	testListenerHost  = "127.0.0.1:9091"
 )
 
 func Benchmark_Start(b *testing.B) {
@@ -21,10 +24,10 @@ func Benchmark_Start(b *testing.B) {
 		return []byte(query), nil
 	}
 
-	go Start(testProxyHost, testRemoteHost, handler)
+	go Start(testBenchmarkHost, testRemoteHost, handler)
 	time.Sleep(3 * time.Second)
 
-	db, err := sqlx.Open("postgres", "host=127.0.0.1 user=postgres password=testpass dbname=testdb port=9090 sslmode=disable")
+	db, err := sqlx.Open("postgres", "host=127.0.0.1 user=postgres password=testpass dbname=testdb port=9092 sslmode=disable")
 	if err != nil {
 		b.Skip("Database connection failed:", err)
 	}
@@ -52,19 +55,26 @@ func Test_Start(t *testing.T) {
 	}
 
 	go Start(testProxyHost, testRemoteHost, handler)
-	time.Sleep(3 * time.Second)
+	// Increase sleep time to ensure proxy is ready
+	time.Sleep(5 * time.Second)
 
 	// Try to connect - skip if database not available
-	db, err := sqlx.Open("postgres", "host=127.0.0.1 user=postgres password=testpass dbname=testdb port=9090 sslmode=disable")
+	// Use a connection timeout to prevent hanging
+	db, err := sqlx.Open("postgres", "host=127.0.0.1 user=postgres password=testpass dbname=testdb port=9090 sslmode=disable connect_timeout=5")
 	if err != nil {
 		t.Skip("Database connection failed:", err)
 	}
 	defer db.Close()
 
+	// Set timeouts for database operations
 	db.SetMaxIdleConns(1)
 	db.SetMaxOpenConns(100)
+	
+	// Set a timeout for the query
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	rows, err := db.Query("select 8 as id")
+	rows, err := db.QueryContext(ctx, "select 8 as id")
 	if err != nil {
 		t.Error(err)
 		return
@@ -89,7 +99,7 @@ func Test_getResolvedAddresses(t *testing.T) {
 }
 
 func Test_getListener(t *testing.T) {
-	paddr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:9090")
+	paddr, err := net.ResolveTCPAddr("tcp", testListenerHost)
 	if err != nil {
 		t.Fatal(err)
 	}

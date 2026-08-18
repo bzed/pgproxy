@@ -70,7 +70,7 @@ linters-settings:
     sections:
       - standard
       - default
-      - prefix(github.com/andrewlouisx/pgproxy)
+      - prefix(github.com/bzed/pgproxy)
     skip-generated: true
     skip-rune-literal: true
   gocognit:

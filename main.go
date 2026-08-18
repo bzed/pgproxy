@@ -6,7 +6,7 @@
 package main
 
 // import (
-// 	"github.com/andrewlouisx/pgproxy/cli"
+// 	"github.com/bzed/pgproxy/cli"
 // )
 
 // func main() {
@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/andrewlouisx/pgproxy/parser"
-	"github.com/andrewlouisx/pgproxy/proxy"
+	"github.com/bzed/pgproxy/parser"
+	"github.com/bzed/pgproxy/proxy"
 )
 
 func main() {

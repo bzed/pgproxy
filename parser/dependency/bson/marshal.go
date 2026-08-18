@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/andrewlouisx/pgproxy/parser/dependency/bytes2"
+	"github.com/bzed/pgproxy/parser/dependency/bytes2"
 )
 
 // LenWriter records the current write position on the buffer

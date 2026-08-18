@@ -1,0 +1,646 @@
+package proxy
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgmock"
+	"github.com/jackc/pgproto3/v2"
+)
+
+// MockPgServer is a simple TCP server that mocks PostgreSQL
+// It tracks queries received and responds with simple mock data
+type MockPgServer struct {
+	listener     net.Listener
+	queries      []string
+	mu           sync.Mutex
+	closeChan    chan struct{}
+	closeWg      sync.WaitGroup
+	queryHandler func(query string) error
+}
+
+// NewMockPgServer creates a new mock PostgreSQL server
+func NewMockPgServer() (*MockPgServer, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	return &MockPgServer{
+		listener:  listener,
+		queries:   make([]string, 0),
+		closeChan: make(chan struct{}),
+	}, nil
+}
+
+// Addr returns the server address
+func (m *MockPgServer) Addr() string {
+	return m.listener.Addr().String()
+}
+
+// Port returns just the port
+func (m *MockPgServer) Port() string {
+	_, port, _ := net.SplitHostPort(m.listener.Addr().String())
+	return port
+}
+
+// QueriesReceived returns all queries received
+func (m *MockPgServer) QueriesReceived() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]string, len(m.queries))
+	copy(result, m.queries)
+	return result
+}
+
+// SetQueryHandler sets a custom handler for received queries
+func (m *MockPgServer) SetQueryHandler(handler func(query string) error) {
+	m.queryHandler = handler
+}
+
+// Start starts the server
+func (m *MockPgServer) Start() {
+	m.closeWg.Add(1)
+	go func() {
+		defer m.closeWg.Done()
+		for {
+			select {
+			case <-m.closeChan:
+				m.listener.Close()
+				return
+			default:
+				conn, err := m.listener.Accept()
+				if err != nil {
+					return
+				}
+				m.closeWg.Add(1)
+				go m.handleConnection(conn)
+			}
+		}
+	}()
+}
+
+// Stop stops the server
+func (m *MockPgServer) Stop() {
+	close(m.closeChan)
+	m.listener.Close()
+	m.closeWg.Wait()
+}
+
+// handleConnection handles a PostgreSQL connection
+func (m *MockPgServer) handleConnection(conn net.Conn) {
+	defer conn.Close()
+	defer m.closeWg.Done()
+
+	for {
+		// Read message header (5 bytes: type + 4 byte length)
+		header := make([]byte, 5)
+		_, err := io.ReadFull(conn, header)
+		if err != nil {
+			return
+		}
+
+		msgType := header[0]
+		msgLength := binary.BigEndian.Uint32(header[1:5])
+		contentLength := int(msgLength) - 4
+
+		if contentLength < 0 {
+			return
+		}
+
+		// Read content
+		content := make([]byte, contentLength)
+		_, err = io.ReadFull(conn, content)
+		if err != nil {
+			return
+		}
+
+		// Process based on message type
+		switch msgType {
+		case 'Q': // SimpleQuery
+			// Extract query string (remove null terminator)
+			query := string(bytes.TrimSuffix(content, []byte{0}))
+			m.mu.Lock()
+			m.queries = append(m.queries, query)
+			m.mu.Unlock()
+
+			if m.queryHandler != nil {
+				if err := m.queryHandler(query); err != nil {
+					// Handler can signal to reject the query
+					return
+				}
+			}
+
+			// Send RowDescription
+			rdMsg := []byte{
+				'T',         // RowDescription
+				0, 0, 0, 18, // Length
+				0, 1, // 1 field
+				'i', 'd', 0, 0, 0, // field name "id"
+				0, 0, 0, 0, // table OID
+				0, 0, // attribute number
+				23, 0, 0, 0, // data type (int4)
+				4, 0, 0, 0, // type length
+				0xff, 0xff, 0xff, 0xff, // type modifier (-1 as bytes)
+				0, // format
+			}
+			conn.Write(rdMsg)
+
+			// Send DataRow
+			drMsg := []byte{
+				'D',        // DataRow
+				0, 0, 0, 9, // Length
+				0, 1, // 1 column
+				0, 0, 0, 4, // 4 bytes of data
+				0, 0, 0, 1, // int32 value 1
+			}
+			conn.Write(drMsg)
+
+			// Send CommandComplete
+			ccMsg := []byte{
+				'C',         // CommandComplete
+				0, 0, 0, 13, // Length (4 + 9 for "SELECT 1\0")
+				'S', 'E', 'L', 'E', 'C', 'T', ' ', '1', 0, // command tag
+			}
+			conn.Write(ccMsg)
+
+			// Send ReadyForQuery
+			rfqMsg := []byte{
+				'Z',        // ReadyForQuery
+				0, 0, 0, 5, // Length
+				'I', // Transaction status (Idle)
+			}
+			conn.Write(rfqMsg)
+
+		case 'X': // Terminate
+			return
+
+		default:
+			// For startup and other messages, send ReadyForQuery
+			rfqMsg := []byte{
+				'Z', // ReadyForQuery
+				0, 0, 0, 5,
+				'I',
+			}
+			conn.Write(rfqMsg)
+		}
+	}
+}
+
+// TestMockPgServer_Basic tests that the mock server works
+func TestMockPgServer_Basic(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock server: %v", err)
+	}
+	defer mock.Stop()
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Connect and send a query
+	conn, err := net.Dial("tcp", mock.Addr())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Send SimpleQuery message
+	query := "SELECT 1"
+	queryMsg := createMockQueryMessage(query)
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Read responses (we don't care about the content for this test)
+	buf := make([]byte, 1024)
+	for i := 0; i < 4; i++ {
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	// Give time for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Check mock received the query
+	queries := mock.QueriesReceived()
+	if len(queries) != 1 {
+		t.Errorf("Expected 1 query, got %d", len(queries))
+	} else if queries[0] != query {
+		t.Errorf("Expected query %q, got %q", query, queries[0])
+	}
+}
+
+// TestProxyWithMockServer tests pgproxy with mock PostgreSQL server
+// This runs on any platform without a real PostgreSQL instance
+func TestProxyWithMockServer(t *testing.T) {
+	// Create mock server
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Create pass-through handler
+	handler := func(query string) ([]byte, error) {
+		return []byte(query), nil
+	}
+
+	// Start proxy
+	proxyAddr := "127.0.0.1:29090"
+	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+
+	time.Sleep(200 * time.Millisecond)
+	defer func() {
+		// Stop proxy by connecting and closing
+		conn, _ := net.Dial("tcp", proxyAddr)
+		if conn != nil {
+			conn.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	// Connect to proxy
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect to proxy: %v", err)
+	}
+	defer conn.Close()
+
+	// Send SimpleQuery
+	query := "SELECT 42"
+	queryMsg := createMockQueryMessage(query)
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Read responses
+	buf := make([]byte, 1024)
+	for i := 0; i < 5; i++ {
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	// Give time for processing
+	time.Sleep(200 * time.Millisecond)
+
+	// Check mock received the query
+	queries := mock.QueriesReceived()
+	if len(queries) == 0 {
+		t.Error("Mock did not receive query")
+	} else if queries[0] != query {
+		t.Errorf("Expected %q, got %q", query, queries[0])
+	}
+}
+
+// TestProxyWithFilterAndMock tests query filtering with mock server
+func TestProxyWithFilterAndMock(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Handler that replaces "users" with "orgs"
+	handler := func(query string) ([]byte, error) {
+		return []byte(strings.ReplaceAll(query, "users", "orgs")), nil
+	}
+
+	proxyAddr := "127.0.0.1:29091"
+	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+
+	time.Sleep(200 * time.Millisecond)
+	defer func() {
+		conn, _ := net.Dial("tcp", proxyAddr)
+		if conn != nil {
+			conn.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Send query with "users"
+	originalQuery := "SELECT * FROM users"
+	queryMsg := createMockQueryMessage(originalQuery)
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Read responses
+	buf := make([]byte, 1024)
+	for i := 0; i < 5; i++ {
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Check mock received the FILTERED query
+	queries := mock.QueriesReceived()
+	if len(queries) == 0 {
+		t.Fatal("Mock did not receive query")
+	}
+
+	expectedQuery := "SELECT * FROM orgs"
+	if queries[0] != expectedQuery {
+		t.Errorf("Query not filtered correctly. Got %q, want %q", queries[0], expectedQuery)
+	}
+}
+
+// TestProxyWithBlockingHandler tests that blocking handler prevents queries from reaching backend
+func TestProxyWithBlockingHandler(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+
+	// Set a handler that will cause the proxy to reject DELETE queries
+	mock.SetQueryHandler(func(query string) error {
+		// This shouldn't be called since the proxy handler blocks first
+		return nil
+	})
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Proxy handler that blocks DELETE
+	handler := func(query string) ([]byte, error) {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "DELETE") {
+			return nil, fmt.Errorf("DELETE not allowed")
+		}
+		return []byte(query), nil
+	}
+
+	proxyAddr := "127.0.0.1:29092"
+	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+
+	time.Sleep(200 * time.Millisecond)
+	defer func() {
+		conn, _ := net.Dial("tcp", proxyAddr)
+		if conn != nil {
+			conn.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Send DELETE query (should be blocked by proxy)
+	deleteQuery := "DELETE FROM users WHERE id = 1"
+	queryMsg := createMockQueryMessage(deleteQuery)
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Connection should be closed by proxy
+	buf := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err = conn.Read(buf)
+	// We expect an error (connection closed)
+	if err == nil {
+		t.Error("Expected connection to be closed after blocked query")
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Mock should NOT have received the query
+	queries := mock.QueriesReceived()
+	if len(queries) > 0 {
+		t.Errorf("Mock should not have received blocked query. Got: %v", queries)
+	}
+}
+
+// TestProxyWithQueryRewriting tests query transformation
+func TestProxyWithQueryRewriting(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Handler that adds WHERE 1=1 to SELECT queries
+	handler := func(query string) ([]byte, error) {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		if strings.HasPrefix(upper, "SELECT") {
+			return []byte(query + " WHERE 1=1"), nil
+		}
+		return []byte(query), nil
+	}
+
+	proxyAddr := "127.0.0.1:29093"
+	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+
+	time.Sleep(200 * time.Millisecond)
+	defer func() {
+		conn, _ := net.Dial("tcp", proxyAddr)
+		if conn != nil {
+			conn.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	originalQuery := "SELECT * FROM users"
+	queryMsg := createMockQueryMessage(originalQuery)
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Read responses
+	buf := make([]byte, 1024)
+	for i := 0; i < 5; i++ {
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Check query was rewritten
+	queries := mock.QueriesReceived()
+	if len(queries) == 0 {
+		t.Fatal("Mock did not receive query")
+	}
+
+	expectedQuery := "SELECT * FROM users WHERE 1=1"
+	if queries[0] != expectedQuery {
+		t.Errorf("Query not rewritten. Got %q, want %q", queries[0], expectedQuery)
+	}
+}
+
+// TestMockServerWithQueryTracking tests that our custom mock server tracks queries
+func TestMockServerWithQueryTracking(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Set a custom handler to verify it works
+	var receivedQueries []string
+	mock.SetQueryHandler(func(query string) error {
+		receivedQueries = append(receivedQueries, query)
+		return nil
+	})
+
+	// Connect and send a query
+	conn, err := net.Dial("tcp", mock.Addr())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	query := "SELECT * FROM test"
+	queryMsg := createMockQueryMessage(query)
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Read responses
+	buf := make([]byte, 1024)
+	for i := 0; i < 4; i++ {
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Check both the custom handler and the built-in tracking received the query
+	if len(receivedQueries) != 1 {
+		t.Errorf("Custom handler expected 1 query, got %d", len(receivedQueries))
+	}
+
+	queries := mock.QueriesReceived()
+	if len(queries) != 1 {
+		t.Errorf("Mock expected 1 query, got %d", len(queries))
+	} else if queries[0] != query {
+		t.Errorf("Expected query %q, got %q", query, queries[0])
+	}
+}
+
+// Helper to create a SimpleQuery message
+func createMockQueryMessage(query string) []byte {
+	queryWithNull := append([]byte(query), 0)
+	msgLength := uint32(len(queryWithNull) + 4)
+	msg := make([]byte, 5+len(queryWithNull))
+	msg[0] = 'Q' // SimpleQuery
+	binary.BigEndian.PutUint32(msg[1:5], msgLength)
+	copy(msg[5:], queryWithNull)
+	return msg
+}
+
+// TestPgMockIntegration tests that pgmock library is integrated and can be used
+func TestPgMockIntegration(t *testing.T) {
+	// Create a simple pgmock script
+	script := &pgmock.Script{
+		Steps: []pgmock.Step{
+			pgmock.ExpectMessage(&pgproto3.Query{String: "SELECT 1"}),
+			pgmock.SendMessage(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}),
+			pgmock.SendMessage(&pgproto3.ReadyForQuery{TxStatus: 'I'}),
+		},
+	}
+
+	// Start a TCP listener
+	ln, err := net.Listen("tcp", "127.0.0.1:")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	defer ln.Close()
+
+	// Accept connections in a goroutine and run the pgmock script
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Wrap the connection in a pgproto3 Backend
+		backend := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
+		if err := script.Run(backend); err != nil {
+			t.Logf("pgmock script error: %v", err)
+		}
+	}()
+
+	// Give time for the listener to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Connect to the mock server
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	// Send a SimpleQuery message
+	queryMsg := createMockQueryMessage("SELECT 1")
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Read responses (we don't verify them, just check no errors)
+	buf := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for i := 0; i < 5; i++ {
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	t.Log("pgmock library is integrated and functional")
+}

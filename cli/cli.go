@@ -11,11 +11,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"syscall"
 	"time"
 
-	"github.com/andrewlouisx/pgproxy/parser"
-	"github.com/andrewlouisx/pgproxy/proxy"
+	"github.com/bzed/pgproxy/parser"
+	"github.com/bzed/pgproxy/proxy"
 	"github.com/golang/glog"
 )
 
@@ -150,11 +149,17 @@ func getCurrentPid() int {
 func stop() {
 	pid := getCurrentPid()
 	if pid != 0 {
-		err := syscall.Kill(pid, syscall.SIGTERM)
+		// Use os.Process.Kill for cross-platform compatibility
+		process, err := os.FindProcess(pid)
 		if err != nil {
 			glog.Errorln(err)
 		} else {
-			glog.Infoln("pgproxy exit successfully!")
+			err = process.Kill()
+			if err != nil {
+				glog.Errorln(err)
+			} else {
+				glog.Infoln("pgproxy exit successfully!")
+			}
 		}
 	}
 	fmt.Printf("pgproxy(%d) Exit,thanks.\n", pid)

@@ -7,7 +7,7 @@ package parser
 import (
 	"testing"
 
-	"github.com/andrewlouisx/pgproxy/parser/dependency/sqltypes"
+	"github.com/bzed/pgproxy/parser/dependency/sqltypes"
 )
 
 func TestParsedQuery(t *testing.T) {
