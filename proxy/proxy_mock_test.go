@@ -644,3 +644,196 @@ func TestPgMockIntegration(t *testing.T) {
 
 	t.Log("pgmock library is integrated and functional")
 }
+
+// TestProxyWithPasswordChangeFilter tests that password changes are blocked
+func TestProxyWithPasswordChangeFilter(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Handler that blocks ALTER USER and SET PASSWORD queries
+	handler := func(query string) ([]byte, error) {
+		upperQuery := strings.ToUpper(strings.TrimSpace(query))
+		// Block password change patterns
+		if strings.Contains(upperQuery, "ALTER USER") && (strings.Contains(upperQuery, "PASSWORD") || strings.Contains(upperQuery, "WITH")) ||
+			strings.Contains(upperQuery, "SET PASSWORD") ||
+			strings.Contains(upperQuery, "CHANGE PASSWORD") {
+			return nil, fmt.Errorf("password changes are not allowed")
+		}
+		return []byte(query), nil
+	}
+
+	proxyAddr := "127.0.0.1:29094"
+	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+
+	time.Sleep(200 * time.Millisecond)
+	defer func() {
+		conn, _ := net.Dial("tcp", proxyAddr)
+		if conn != nil {
+			conn.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	// Test each password change pattern in a separate proxy/mock setup
+	passwordChangeQueries := []string{
+		"ALTER USER postgres WITH PASSWORD 'newpass'",
+		"ALTER USER postgres PASSWORD 'newpass'",
+		"SET PASSWORD 'newpass' FOR postgres",
+	}
+
+	for _, query := range passwordChangeQueries {
+		mock.mu.Lock()
+		mock.queries = nil
+		mock.mu.Unlock()
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+
+		queryMsg := createMockQueryMessage(query)
+		_, err = conn.Write(queryMsg)
+		if err != nil {
+			conn.Close()
+			t.Fatalf("Failed to write: %v", err)
+		}
+
+		// Connection should be closed by proxy due to blocked query
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, err = conn.Read(make([]byte, 1024))
+		conn.Close()
+		// We expect an error (connection closed)
+		if err == nil {
+			t.Errorf("Password change query %q was not blocked", query)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Verify that no password change queries reached the mock server
+	queries := mock.QueriesReceived()
+	if len(queries) > 0 {
+		t.Errorf("Mock server should not have received any blocked password change queries. Got: %v", queries)
+	}
+}
+
+// TestProxyWithReadOnlyFilter tests that only SELECT queries are allowed
+func TestProxyWithReadOnlyFilter(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Handler that only allows SELECT queries (read-only)
+	handler := func(query string) ([]byte, error) {
+		upperQuery := strings.ToUpper(strings.TrimSpace(query))
+		// Only allow SELECT queries
+		if !strings.HasPrefix(upperQuery, "SELECT") {
+			return nil, fmt.Errorf("only SELECT queries are allowed (read-only mode)")
+		}
+		return []byte(query), nil
+	}
+
+	proxyAddr := "127.0.0.1:29095"
+	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+
+	time.Sleep(200 * time.Millisecond)
+	defer func() {
+		conn, _ := net.Dial("tcp", proxyAddr)
+		if conn != nil {
+			conn.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	// Test SELECT query - should be allowed and forwarded
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+
+	selectQuery := "SELECT * FROM users"
+	queryMsg := createMockQueryMessage(selectQuery)
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Read responses
+	buf := make([]byte, 1024)
+	for i := 0; i < 5; i++ {
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+	conn.Close()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Check that SELECT query reached the mock server
+	queries := mock.QueriesReceived()
+	if len(queries) == 0 {
+		t.Error("SELECT query should have reached the mock server")
+	} else if queries[0] != selectQuery {
+		t.Errorf("Expected SELECT query %q, got %q", selectQuery, queries[0])
+	}
+
+	// Clear queries for next test
+	mock.mu.Lock()
+	mock.queries = nil
+	mock.mu.Unlock()
+
+	// Test non-SELECT queries - should be blocked
+	writeOnlyQueries := []string{
+		"INSERT INTO users VALUES (1, 'test')",
+		"UPDATE users SET name = 'new' WHERE id = 1",
+		"DELETE FROM users WHERE id = 1",
+		"CREATE TABLE test (id int)",
+		"DROP TABLE test",
+	}
+
+	for _, query := range writeOnlyQueries {
+		mock.mu.Lock()
+		mock.queries = nil
+		mock.mu.Unlock()
+
+		conn, err = net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+
+		queryMsg = createMockQueryMessage(query)
+		_, err = conn.Write(queryMsg)
+		if err != nil {
+			conn.Close()
+			t.Fatalf("Failed to write: %v", err)
+		}
+
+		// Connection should be closed by proxy
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, err = conn.Read(buf)
+		conn.Close()
+		if err == nil {
+			t.Errorf("Query %q should have been blocked", query)
+		}
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify query was not forwarded
+		queries = mock.QueriesReceived()
+		if len(queries) > 0 {
+			t.Errorf("Query %q should not have reached the mock server. Got: %v", query, queries)
+		}
+	}
+}
