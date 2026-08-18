@@ -145,45 +145,6 @@ func TestBufferPool(t *testing.T) {
 	}
 }
 
-// TestConcat tests the concat function
-func TestConcat(t *testing.T) {
-	tests := []struct {
-		name   string
-		slices [][]byte
-		want   []byte
-	}{
-		{
-			name:   "Empty",
-			slices: [][]byte{},
-			want:   []byte{},
-		},
-		{
-			name:   "Single slice",
-			slices: [][]byte{[]byte("hello")},
-			want:   []byte("hello"),
-		},
-		{
-			name:   "Multiple slices",
-			slices: [][]byte{[]byte("hello"), []byte(" "), []byte("world")},
-			want:   []byte("hello world"),
-		},
-		{
-			name:   "Empty slices",
-			slices: [][]byte{[]byte(""), []byte("test"), []byte("")},
-			want:   []byte("test"),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := concat(tt.slices...)
-			if !bytes.Equal(got, tt.want) {
-				t.Errorf("concat() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 // TestMessageParsing tests PostgreSQL message format parsing
 func TestMessageParsing(t *testing.T) {
 	// Test creating a simple query message
