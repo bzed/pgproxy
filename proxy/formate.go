@@ -39,7 +39,7 @@ func RowsFormater(rows *sql.Rows) {
 	for rows.Next() {
 		columns := make([]interface{}, len(cols))
 		columnPointers := make([]interface{}, len(cols))
-		for i, _ := range columns {
+		for i := range columns {
 			columnPointers[i] = &columns[i]
 		}
 
@@ -51,7 +51,7 @@ func RowsFormater(rows *sql.Rows) {
 		// Create our map, and retrieve the value for each column from the pointers slice,
 		// storing it in the map with the name of the column as the key.
 		row := make([]string, 0)
-		for i, _ := range cols {
+		for i := range cols {
 			val := columnPointers[i].(*interface{})
 			row = append(row, interface2String(*val))
 		}
@@ -83,13 +83,13 @@ func ResultFormater(res sql.Result) {
 
 // Convert type interface{} into string just for friendly display.
 func interface2String(input interface{}) string {
-	switch input.(type) {
+	switch v := input.(type) {
 	case string:
-		return input.(string)
+		return v
 	case int64:
-		return strconv.FormatInt(input.(int64), 10)
+		return strconv.FormatInt(v, 10)
 	case []byte:
-		return string(input.([]byte))
+		return string(v)
 	default:
 		return ""
 	}

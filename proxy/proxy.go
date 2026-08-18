@@ -51,7 +51,7 @@ func Start(proxyHost, remoteHost string, handler Handler) {
 			erred:   false,
 			errsig:  make(chan bool),
 			prefix:  fmt.Sprintf("Connection #%03d ", connid),
-			connId:  connid,
+			connID:  connid,
 			bufPool: &bufferPool{},
 		}
 		go p.service(handler)
@@ -78,15 +78,13 @@ func getListener(addr *net.TCPAddr) *net.TCPListener {
 
 // Proxy - Manages a Proxy connection, piping data between proxy and remote.
 type Proxy struct {
-	sentBytes     uint64
-	receivedBytes uint64
-	laddr, raddr  *net.TCPAddr
-	lconn, rconn  *net.TCPConn
-	erred         bool
-	errsig        chan bool
-	prefix        string
-	connId        uint64
-	bufPool       *bufferPool
+	laddr, raddr *net.TCPAddr
+	lconn, rconn *net.TCPConn
+	erred        bool
+	errsig       chan bool
+	prefix       string
+	connID       uint64
+	bufPool      *bufferPool
 }
 
 // bufferPool provides buffer pooling for performance optimization
@@ -96,7 +94,7 @@ type bufferPool struct {
 
 func (bp *bufferPool) Get() []byte {
 	if b := bp.pool.Get(); b != nil {
-		return b.([]byte)
+		return *(b.(*[]byte))
 	}
 	return make([]byte, 65536) // 64KB default buffer
 }
@@ -105,7 +103,7 @@ func (bp *bufferPool) Put(b []byte) {
 	// Only pool buffers that are reasonably sized
 	if cap(b) >= 4096 && cap(b) <= 65536 {
 		b = b[:cap(b)]
-		bp.pool.Put(b)
+		bp.pool.Put(&b)
 	}
 }
 
@@ -119,7 +117,7 @@ func New(conn *net.TCPConn, proxyAddr, remoteAddr *net.TCPAddr, connid uint64) *
 		erred:   false,
 		errsig:  make(chan bool),
 		prefix:  fmt.Sprintf("Connection #%03d ", connid),
-		connId:  connid,
+		connID:  connid,
 		bufPool: &bufferPool{},
 	}
 }
@@ -308,17 +306,4 @@ func HandleQuery(msgType byte, content []byte, requestHandler Handler) ([]byte, 
 		return append(content, 0), nil
 	}
 	return content, nil
-}
-
-// Concat concatenates slices of bytes.
-func concat(slices ...[]byte) []byte {
-	var totalLen int
-	for _, s := range slices {
-		totalLen += len(s)
-	}
-	result := make([]byte, 0, totalLen)
-	for _, s := range slices {
-		result = append(result, s...)
-	}
-	return result
 }

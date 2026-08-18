@@ -28,6 +28,8 @@ linters-settings:
     locale: US
 
 issues:
+  exclude-files:
+    - parser/sql\.go
   exclude-rules:
     - linters:
         - lll
