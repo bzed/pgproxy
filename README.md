@@ -1,30 +1,28 @@
 ![pgproxy](./pgproxy.png)
 
 # pgproxy
-[![Build Status](https://github.com/andrewlouisx/pgproxy/actions/workflows/go-test.yml/badge.svg?branch=master)](https://github.com/andrewlouisx/pgproxy/actions/workflows/go-test.yml)
-[![codecov](https://codecov.io/gh/andrewlouisx/pgproxy/branch/master/graph/badge.svg)](https://codecov.io/gh/andrewlouisx/pgproxy)
-[![GoDoc](https://godoc.org/github.com/andrewlouisx/pgproxy?status.svg)](https://godoc.org/github.com/andrewlouisx/pgproxy)
-[![Code Health](https://landscape.io/github/andrewlouisx/pgproxy/master/landscape.svg?style=flat)](https://landscape.io/github/andrewlouisx/pgproxy/master)
-[![Code Issues](https://www.quantifiedcode.com/api/v1/project/98b2cb0efd774c5fa8f9299c4f96a8c5/badge.svg)](https://www.quantifiedcode.com/app/project/98b2cb0efd774c5fa8f9299c4f96a8c5)
-[![Go Report Card](https://goreportcard.com/badge/github.com/andrewlouisx/pgproxy)](https://goreportcard.com/report/github.com/andrewlouisx/pgproxy)
+[![Build Status](https://github.com/bzed/pgproxy/actions/workflows/go-test.yml/badge.svg?branch=master)](https://github.com/bzed/pgproxy/actions/workflows/go-test.yml)
+[![codecov](https://codecov.io/gh/bzed/pgproxy/branch/master/graph/badge.svg)](https://codecov.io/gh/bzed/pgproxy)
+[![GoDoc](https://pkg.go.dev/github.com/bzed/pgproxy?status.svg)](https://pkg.go.dev/github.com/bzed/pgproxy)
+[![Go Report Card](https://goreportcard.com/badge/github.com/bzed/pgproxy)](https://goreportcard.com/report/github.com/bzed/pgproxy)
 [![License](https://img.shields.io/badge/LICENSE-Apache2.0-ff69b4.svg)](http://www.apache.org/licenses/LICENSE-2.0.html)
 
-pgproxy is a postgresql proxy server, through a pipe redirect connection, which allows you to filter the requested sql statement. In the future it will support multi-database backup, adapt to distributed databases and other schemes except the  analyze sql statement.
+pgproxy is a PostgreSQL proxy server that uses pipe redirect connections to filter requested SQL statements. In the future it will support multi-database backup, distributed database adaptation, and other features beyond SQL analysis.
 
-You can do:
+## Features
 
-* database read and write separation
-* database services disaster recovery
-* proxy database
-* rewrite sql statement
-* filter dangerous sql
-* monitor database operations
-* sql requests current limit and merge
+* Database read/write separation
+* Database services disaster recovery
+* Proxy database connections
+* Rewrite SQL statements
+* Filter dangerous SQL
+* Monitor database operations
+* SQL request current limiting and merging
 
 ## Installation
 
 ```
-$ go get -u github.com/andrewlouisx/pgproxy
+$ go get -u github.com/bzed/pgproxy
 ```
 
 ## Using
@@ -41,11 +39,11 @@ Use pgproxy on the command line
 $ pgproxy cli
 ```
 
-Ps: You can use it as you would with a native command line.
+Note: You can use it as you would with a native command line.
 
 ### Be called as a package
 
-[package_example](https://github.com/andrewlouisx/pgproxy/blob/master/examples/package_example.go)
+[package_example](https://github.com/bzed/pgproxy/blob/master/examples/package_example.go)
 
 ```
 package main
@@ -56,14 +54,14 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/andrewlouisx/pgproxy/cli"
+	"github.com/bzed/pgproxy/cli"
 )
 
 func main() {
 	// call proxy
 	cli.Main("../pgproxy.conf", []string{"pgproxy", "start"})
 	
-	// 捕获ctrl-c,平滑退出
+	// Capture ctrl-c for graceful exit
 	chExit := make(chan os.Signal, 1)
 	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	select {
@@ -74,15 +72,15 @@ func main() {
 
 ```
 
-## Support
+## SQL Support
 
-select/delete/update statement and support any case.
+Supports SELECT, DELETE, UPDATE statements in any case.
 
-On the support of the sql standard：
+### SQL Standard Support:
 
-The parser is forked from vitess's [sqlparser](https://github.com/youtube/vitess/tree/master/go/vt/sqlparser) of youtube.
+The parser is forked from vitess's [sqlparser](https://github.com/youtube/vitess/tree/master/go/vt/sqlparser) of YouTube.
 
-In pgproxy, database tables are like MySQL(5.6,5.7) relational tables, and you can use relational modeling schemes (normalization) to structure your schema. It supports almost all MySQL(5.6,5.7) scalar data types. It also provides full SQL support within a shard, including JOIN statements. Some postgresql operations are not supported,detail see [support type and keywords](https://github.com/andrewlouisx/pgproxy/blob/master/parser/token.go#L37).
+In pgproxy, database tables are like MySQL(5.6,5.7) relational tables, and you can use relational modeling schemes (normalization) to structure your schema. It supports almost all MySQL(5.6,5.7) scalar data types. It also provides full SQL support within a shard, including JOIN statements. Some PostgreSQL operations are not supported; detail see [supported types and keywords](https://github.com/bzed/pgproxy/blob/master/parser/token.go#L37).
 
 
 ## Credits
