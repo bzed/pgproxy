@@ -177,13 +177,12 @@ func isQueryMessage(msgType byte) bool {
 
 // Proxy.handleIncomingConnection processes incoming client messages
 func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Handler) {
-	// Use a larger buffer and pool it
 	buff := p.bufPool.Get()
 	defer p.bufPool.Put(buff)
 
 	for {
-		// Read at least 5 bytes (1 byte type + 4 bytes length)
-		_, err := io.ReadFull(src, buff[:5])
+		// Read the first byte to determine message format
+		_, err := io.ReadFull(src, buff[:1])
 		if err != nil {
 			if err == io.EOF {
 				p.err("Client closed connection", err)
@@ -193,38 +192,62 @@ func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Ha
 			return
 		}
 
-		msgType := buff[0]
-		msgLength := binary.BigEndian.Uint32(buff[1:5])
+		var msgType byte
+		var msgLength uint32
+		var headerSize int
 
-		// msgLength includes the 4 bytes of the length field
-		// So total message size = 1 (type) + 4 (length) + (msgLength - 4) = msgLength + 1
+		// If the first byte is 0x00, it's a StartupMessage, SSLRequest, or CancelRequest.
+		// These messages do not have a 1-byte message type; they start directly with a 4-byte length.
+		if buff[0] == 0 {
+			// Read the remaining 3 bytes of the 4-byte length
+			_, err = io.ReadFull(src, buff[1:4])
+			if err != nil {
+				p.err("Read length failed: %s\n", err)
+				return
+			}
+			msgType = 0
+			msgLength = binary.BigEndian.Uint32(buff[:4])
+			headerSize = 4
+		} else {
+			// Normal message: 1-byte type followed by 4-byte length
+			msgType = buff[0]
+			_, err = io.ReadFull(src, buff[1:5])
+			if err != nil {
+				p.err("Read length failed: %s\n", err)
+				return
+			}
+			msgLength = binary.BigEndian.Uint32(buff[1:5])
+			headerSize = 5
+		}
+
 		totalContentLength := int(msgLength) - 4
-
 		if totalContentLength < 0 {
 			p.err("Invalid message length", fmt.Errorf("invalid message length: %d", msgLength))
 			return
 		}
 
 		// Ensure buffer is large enough
-		if len(buff) < 5+totalContentLength {
-			newBuff := make([]byte, 5+totalContentLength)
-			copy(newBuff, buff[:5])
+		if len(buff) < headerSize+totalContentLength {
+			newBuff := make([]byte, headerSize+totalContentLength)
+			copy(newBuff, buff[:headerSize])
 			p.bufPool.Put(buff)
 			buff = newBuff
 		}
 
-		// Read the rest of the message
-		_, err = io.ReadFull(src, buff[5:5+totalContentLength])
-		if err != nil {
-			p.err("Read content failed: %s\n", err)
-			return
+		// Read the rest of the message content
+		if totalContentLength > 0 {
+			_, err = io.ReadFull(src, buff[headerSize:headerSize+totalContentLength])
+			if err != nil {
+				p.err("Read content failed: %s\n", err)
+				return
+			}
 		}
 
-		fullMsg := buff[:5+totalContentLength]
-		content := buff[5 : 5+totalContentLength]
+		fullMsg := buff[:headerSize+totalContentLength]
 
-		// Process the message if it's a query type
-		if isQueryMessage(msgType) && totalContentLength > 0 {
+		// Process the message if it's a query type (only normal messages have a type)
+		if msgType != 0 && isQueryMessage(msgType) && totalContentLength > 0 {
+			content := buff[headerSize : headerSize+totalContentLength]
 			modifiedContent, err := HandleQuery(msgType, content, customHandler)
 			if err != nil {
 				p.err("Query handling error: %s\n", err)
@@ -252,50 +275,11 @@ func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Ha
 
 // Proxy.handleResponseConnection forwards server responses to client
 func (p *Proxy) handleResponseConnection(src, dst *net.TCPConn) {
-	buff := p.bufPool.Get()
-	defer p.bufPool.Put(buff)
-
-	for {
-		// Read message header
-		_, err := io.ReadFull(src, buff[:5])
-		if err != nil {
-			if err == io.EOF {
-				p.err("Server closed connection", err)
-			} else {
-				p.err("Response read header failed: %s\n", err)
-			}
-			return
-		}
-
-		msgLength := binary.BigEndian.Uint32(buff[1:5])
-		totalContentLength := int(msgLength) - 4
-
-		if totalContentLength < 0 {
-			p.err("Invalid response message length", fmt.Errorf("invalid length: %d", msgLength))
-			return
-		}
-
-		// Ensure buffer is large enough
-		if len(buff) < 5+totalContentLength {
-			newBuff := make([]byte, 5+totalContentLength)
-			copy(newBuff, buff[:5])
-			p.bufPool.Put(buff)
-			buff = newBuff
-		}
-
-		// Read the rest
-		_, err = io.ReadFull(src, buff[5:5+totalContentLength])
-		if err != nil {
-			p.err("Response read content failed: %s\n", err)
-			return
-		}
-
-		// Write to destination
-		_, err = dst.Write(buff[:5+totalContentLength])
-		if err != nil {
-			p.err("Response write failed: %s\n", err)
-			return
-		}
+	// Server -> Client messages do not need to be parsed by this proxy.
+	// A simple io.Copy prevents deadlocks with 1-byte responses like SSLRequest's 'S' or 'N'.
+	_, err := io.Copy(dst, src)
+	if err != nil && err != io.EOF {
+		p.err("Server response error: %s\n", err)
 	}
 }
 
