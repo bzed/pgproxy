@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/andrewlouisx/pgproxy/parser"
+	"github.com/andrewlouisx/pgproxy/proxy"
 	"github.com/golang/glog"
 )
 
@@ -49,7 +51,11 @@ func Main(config interface{}, pargs interface{}) {
 			info(pc.ServerConfig.ProxyAddr)
 			logDir()
 			saveCurrentPid()
-			//proxy.Start(pc.ServerConfig.ProxyAddr, pc.DB["master"].Addr, parser.Filter, parser.Return)
+			// Start the proxy with a pass-through handler
+			// Users can provide their own handler via configuration in the future
+			go func() {
+				proxy.Start(pc.ServerConfig.ProxyAddr, pc.DB["master"].Addr, parser.ReturnHandler)
+			}()
 			glog.Infoln("Started pgproxy successfully.")
 		} else if args[1] == "cli" {
 			Command()

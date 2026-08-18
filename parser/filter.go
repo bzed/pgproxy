@@ -12,17 +12,20 @@ import (
 	"github.com/golang/glog"
 )
 
-// GetQueryModificada calllback
-func GetQueryModificada(queryOriginal string) string {
-	if queryOriginal[:5] != "power" {
-
-		return queryOriginal
+// GetQueryModificada callback - Handler function for proxy
+// Receives query string and returns modified query bytes
+func GetQueryModificada(query string) ([]byte, error) {
+	// Example: if query doesn't start with "power", pass through
+	// Note: this is a simple example, real implementations would do more sophisticated filtering
+	if len(query) < 5 || query[:5] != "power" {
+		return []byte(query), nil
 	}
-	return "select * from clientes limit 1;"
+	return []byte("select * from clientes limit 1;"), nil
 }
 
+// Filter checks if the SQL statement meets certain criteria
+// Returns true if the query should be allowed
 func Filter(str []byte) bool {
-	//sql := Extracte(str)
 	tree, err := Parse(string(str))
 	if err != nil {
 		glog.Errorln(err)
@@ -42,9 +45,10 @@ func Filter(str []byte) bool {
 	return false
 }
 
-func Return(str []byte) bool {
-	fmt.Println(string(str))
-	return true
+// ReturnHandler is a Handler that just logs and passes through the query
+func ReturnHandler(query string) ([]byte, error) {
+	fmt.Println("Query:", query)
+	return []byte(query), nil
 }
 
 func ParseSelect(sql *Select) bool {

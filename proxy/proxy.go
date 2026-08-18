@@ -7,10 +7,12 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
+	"sync"
 
 	"github.com/golang/glog"
 )
@@ -20,8 +22,8 @@ var (
 )
 
 // Handler function from proxy to postgresql for rewrite
-// request or sql.
-type Handler func(get []byte) ([]byte, error)
+// request or sql. Receives the query string and returns modified bytes.
+type Handler func(query string) ([]byte, error)
 
 // Start proxy server needed receive  and proxyHost, all
 // the request or database's sql of receive will redirect
@@ -50,6 +52,7 @@ func Start(proxyHost, remoteHost string, handler Handler) {
 			errsig: make(chan bool),
 			prefix: fmt.Sprintf("Connection #%03d ", connid),
 			connId: connid,
+			bufPool: &bufferPool{},
 		}
 		go p.service(handler)
 	}
@@ -83,6 +86,27 @@ type Proxy struct {
 	errsig        chan bool
 	prefix        string
 	connId        uint64
+	bufPool       *bufferPool
+}
+
+// bufferPool provides buffer pooling for performance optimization
+type bufferPool struct {
+	pool sync.Pool
+}
+
+func (bp *bufferPool) Get() []byte {
+	if b := bp.pool.Get(); b != nil {
+		return b.([]byte)
+	}
+	return make([]byte, 65536) // 64KB default buffer
+}
+
+func (bp *bufferPool) Put(b []byte) {
+	// Only pool buffers that are reasonably sized
+	if cap(b) >= 4096 && cap(b) <= 65536 {
+		b = b[:cap(b)]
+		bp.pool.Put(b)
+	}
 }
 
 // New - Create a new Proxy instance. Takes over local connection passed in,
@@ -96,6 +120,7 @@ func New(conn *net.TCPConn, proxyAddr, remoteAddr *net.TCPAddr, connid uint64) *
 		errsig: make(chan bool),
 		prefix: fmt.Sprintf("Connection #%03d ", connid),
 		connId: connid,
+		bufPool: &bufferPool{},
 	}
 }
 
@@ -129,120 +154,179 @@ func (p *Proxy) service(handler Handler) {
 	<-p.errsig
 }
 
-var statementCodes = map[string]interface{}{
-	"Q": nil,
-	"P": nil,
-}
+// PostgreSQL message types
+const (
+	SimpleQuery = 'Q' // Simple Query message
+	ParseMsg    = 'P' // Parse message
+	BindMsg     = 'B' // Bind message
+	ExecuteMsg  = 'E' // Execute message
+	DescribeMsg = 'D' // Describe message
+	CloseMsg    = 'C' // Close message
+	SyncMsg     = 'S' // Sync message
+	Terminate   = 'X' // Terminate message
+)
 
-func isStatement(input string) bool {
-	if _, ok := statementCodes[string(input[0])]; ok {
+// isQueryMessage returns true for message types that might contain SQL
+func isQueryMessage(msgType byte) bool {
+	switch msgType {
+	case SimpleQuery, ParseMsg, BindMsg:
 		return true
 	}
-
 	return false
 }
 
-const (
-	// Query - Query message.
-	Query = 'Q'
-	// Bind
-	Bind = 'P'
-)
-
-// Proxy.handleIncomingConnection
+// Proxy.handleIncomingConnection processes incoming client messages
 func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Handler) {
-	// directional copy (64k buffer)
-	buff := make([]byte, 0xffff)
+	// Use a larger buffer and pool it
+	buff := p.bufPool.Get()
+	defer p.bufPool.Put(buff)
 
 	for {
-		n, err := src.Read(buff)
+		// Read at least 5 bytes (1 byte type + 4 bytes length)
+		_, err := io.ReadFull(src, buff[:5])
 		if err != nil {
-			p.err("Read failed '%s'\n", err)
+			if err == io.EOF {
+				p.err("Client closed connection", err)
+			} else {
+				p.err("Read header failed: %s\n", err)
+			}
 			return
 		}
 
-		bufff := buff[:n]
+		msgType := buff[0]
+		msgLength := binary.BigEndian.Uint32(buff[1:5])
+		
+		// msgLength includes the 4 bytes of the length field
+		// So total message size = 1 (type) + 4 (length) + (msgLength - 4) = msgLength + 1
+		totalContentLength := int(msgLength) - 4
+		
+		if totalContentLength < 0 {
+			p.err("Invalid message length", fmt.Errorf("invalid message length: %d", msgLength))
+			return
+		}
 
-		// if string(buff[0]) is P or Q - we recognize
-		// as a query
-		if len(bufff) > 0 && isStatement(string(bufff[0])) {
-			b, err := handleQuery(bufff, customHandler)
+		// Ensure buffer is large enough
+		if len(buff) < 5+totalContentLength {
+			newBuff := make([]byte, 5+totalContentLength)
+			copy(newBuff, buff[:5])
+			p.bufPool.Put(buff)
+			buff = newBuff
+		}
+		
+		// Read the rest of the message
+		_, err = io.ReadFull(src, buff[5:5+totalContentLength])
+		if err != nil {
+			p.err("Read content failed: %s\n", err)
+			return
+		}
+
+		fullMsg := buff[:5+totalContentLength]
+		content := buff[5 : 5+totalContentLength]
+
+		// Process the message if it's a query type
+		if isQueryMessage(msgType) && totalContentLength > 0 {
+			modifiedContent, err := HandleQuery(msgType, content, customHandler)
 			if err != nil {
-				p.err("%s\n", err)
-				err = dst.Close()
-				if err != nil {
-					glog.Errorln(err)
-				}
+				p.err("Query handling error: %s\n", err)
 				return
 			}
 
-			bufff = b
+			// Reconstruct message if content was modified
+			if modifiedContent != nil && !bytes.Equal(modifiedContent, content) {
+				newMsg := make([]byte, 5+len(modifiedContent))
+				newMsg[0] = msgType
+				binary.BigEndian.PutUint32(newMsg[1:5], uint32(len(modifiedContent)+4))
+				copy(newMsg[5:], modifiedContent)
+				fullMsg = newMsg
+			}
 		}
 
-		_, err = dst.Write(bufff)
+		// Write to destination
+		_, err = dst.Write(fullMsg)
 		if err != nil {
-			p.err("Write failed '%s'\n", err)
+			p.err("Write failed: %s\n", err)
 			return
 		}
 	}
 }
 
-// Proxy.handleResponseConnection
+// Proxy.handleResponseConnection forwards server responses to client
 func (p *Proxy) handleResponseConnection(src, dst *net.TCPConn) {
-	// directional copy (64k buffer)
-	buff := make([]byte, 0xffff)
+	buff := p.bufPool.Get()
+	defer p.bufPool.Put(buff)
 
 	for {
-		n, err := src.Read(buff)
+		// Read message header
+		_, err := io.ReadFull(src, buff[:5])
 		if err != nil {
-			p.err("Read failed '%s'\n", err)
+			if err == io.EOF {
+				p.err("Server closed connection", err)
+			} else {
+				p.err("Response read header failed: %s\n", err)
+			}
 			return
 		}
 
-		_, err = dst.Write(buff[:n])
+		msgLength := binary.BigEndian.Uint32(buff[1:5])
+		totalContentLength := int(msgLength) - 4
+		
+		if totalContentLength < 0 {
+			p.err("Invalid response message length", fmt.Errorf("invalid length: %d", msgLength))
+			return
+		}
+
+		// Ensure buffer is large enough
+		if len(buff) < 5+totalContentLength {
+			newBuff := make([]byte, 5+totalContentLength)
+			copy(newBuff, buff[:5])
+			p.bufPool.Put(buff)
+			buff = newBuff
+		}
+
+		// Read the rest
+		_, err = io.ReadFull(src, buff[5:5+totalContentLength])
 		if err != nil {
-			p.err("Write failed '%s'\n", err)
+			p.err("Response read content failed: %s\n", err)
+			return
+		}
+
+		// Write to destination
+		_, err = dst.Write(buff[:5+totalContentLength])
+		if err != nil {
+			p.err("Response write failed: %s\n", err)
 			return
 		}
 	}
 }
 
-// query here is somewhat general -- SQL statements are all queries;
-// see https://www.postgresql.org/docs/13/protocol-message-formats.html
-func handleQuery(input []byte, requestHandler Handler) ([]byte, error) {
-	fmt.Println("----Request Received------")
-	fmt.Println(string(input))
-
-	if len(input) > 0 && string(input[0]) == "Q" {
-		// TODO: ";", "0" characters should be handled idiomatically
-
-		// first 4 are metadata
-		// last character is a NULL / EOF "0"
-
-		// makes an assumption that the last two characters are ";", "0"
-		lastTwoBytes := input[len(input)-2:]
-
-		queryStr := input[5 : len(input)-2]
-
-		data, err := requestHandler(queryStr)
-		if err != nil {
-			log.Fatalln("we failed here", err)
-		}
-
-		result := concat(input[0:5], data, lastTwoBytes)
-
-		// update the checksum, because we may have modified
-		// the query
-		result[4] = byte(len(result) - 1)
-
-		return result, nil
+// HandleQuery processes query content and applies the handler
+func HandleQuery(msgType byte, content []byte, requestHandler Handler) ([]byte, error) {
+	// Remove null terminator if present
+	queryStr := string(bytes.TrimSuffix(content, []byte{0}))
+	
+	// Call handler with query string
+	data, err := requestHandler(queryStr)
+	if err != nil {
+		return nil, fmt.Errorf("handler error: %w", err)
 	}
-
-	// no-op if not a Simple Query
-	return input, nil
+	
+	// If handler returns data, use it
+	if data != nil {
+		// Ensure null terminator
+		if len(data) == 0 || data[len(data)-1] != 0 {
+			data = append(data, 0)
+		}
+		return data, nil
+	}
+	
+	// Return original content with null terminator
+	if len(content) == 0 || content[len(content)-1] != 0 {
+		return append(content, 0), nil
+	}
+	return content, nil
 }
 
-// Concat concatenates two slices of strings.
+// Concat concatenates slices of bytes.
 func concat(slices ...[]byte) []byte {
 	var totalLen int
 	for _, s := range slices {
@@ -254,14 +338,3 @@ func concat(slices ...[]byte) []byte {
 	}
 	return result
 }
-
-//// ModifiedBuffer when is local and will call filterCallback function
-//func getModifiedBuffer(buffer []byte, filterCallback Handler) (b []byte, err error) {
-//	if len(buffer) > 0 && string(buffer[0]) == "Q" {
-//		if !filterCallback(buffer) {
-//			return nil, errors.New(fmt.Sprintf("Do not meet the rules of the sql statement %s", string(buffer[1:])))
-//		}
-//	}
-//
-//	return buffer, nil
-//}

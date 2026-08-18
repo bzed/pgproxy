@@ -16,7 +16,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/andrewlouisx/pgproxy/parser"
@@ -36,36 +35,29 @@ type Metadata struct {
 	TransactionId string `json:"transaction_id"`
 }
 
-func loggingHandler(input []byte) ([]byte, error) {
-	fmt.Println("invoked")
+func loggingHandler(query string) ([]byte, error) {
+	fmt.Println("Handler invoked with query:", query)
 
-	statement, err := parser.Parse(string(input))
+	statement, err := parser.Parse(query)
 	if err != nil {
-		fmt.Println(err)
-		return nil, err
+		fmt.Println("Parse error:", err)
+		// Return original query on parse error
+		return []byte(query), nil
 	}
 
-	fmt.Println("statement", statement)
+	fmt.Println("Parsed statement:", statement)
 
-	// convert byte slice to string
-	rawQuery := string(input)
+	// Rebuild the query from the parsed statement
+	// This can be used to normalize or rewrite the query
+	rewrittenQuery := parser.String(statement)
+	fmt.Println("Rewritten query:", rewrittenQuery)
 
-	fmt.Println("rawQuery", rawQuery)
+	// Example: Replace table names
+	// if strings.Contains(rewrittenQuery, "users") {
+	//	rewrittenQuery = strings.Replace(rewrittenQuery, "users", "orgs", -1)
+	// }
 
-	// if string contains users -- make it
-	// orgs
-	//if strings.Contains(rawQuery, "users") {
-	//	rawQuery = strings.Replace(rawQuery, "users", "orgs", -1)
-	//}
-
-	stmt, err := parser.Parse(rawQuery)
-	if err != nil {
-		log.Fatalln(err)
-		return nil, err
-	}
-
-	// build statement
-	return []byte(parser.String(stmt)), nil
+	return []byte(rewrittenQuery), nil
 }
 
 func getQueryMetadata(input string) (*Metadata, error) {

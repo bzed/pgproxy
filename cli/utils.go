@@ -25,7 +25,7 @@ const Logo = `
 `
 
 const (
-	VERSION = "version-0.0.1"
+	VERSION = "0.1.0"
 )
 
 // proxy server config struct
@@ -43,16 +43,26 @@ type ProxyConfig struct {
 
 func readConfig(file string) (pc ProxyConfig, connStr string) {
 	if _, err := os.Stat(file); os.IsNotExist(err) {
-		glog.Errorln(err)
+		glog.Errorln("Configuration file not found:", err)
 		os.Exit(int(syscall.ENOENT))
 	}
 
 	if _, err := toml.DecodeFile(file, &pc); err != nil {
-		glog.Fatalln(err)
+		glog.Fatalln("Failed to parse configuration file:", err)
 	}
 
-	sepindex := strings.Index(pc.DB["master"].Addr, ":")
+	// Check if master database is configured
+	if _, ok := pc.DB["master"]; !ok {
+		glog.Fatalln("Configuration error: DB.master not found in configuration file")
+	}
+
+	master := pc.DB["master"]
+	sepindex := strings.Index(master.Addr, ":")
+	
+	if sepindex == -1 {
+		glog.Fatalln("Invalid database address format in configuration. Expected 'host:port'")
+	}
 
 	return pc, fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s application_name=pgproxy sslmode=disable",
-		pc.DB["master"].Addr[0:sepindex], pc.DB["master"].Addr[(sepindex+1):], pc.DB["master"].User, pc.DB["master"].Password, pc.DB["master"].DbName)
+		master.Addr[0:sepindex], master.Addr[(sepindex+1):], master.User, master.Password, master.DbName)
 }

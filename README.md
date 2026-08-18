@@ -1,7 +1,7 @@
 ![pgproxy](./pgproxy.png)
 
 # pgproxy
-[![Build Status](https://travis-ci.org/andrewlouisx/pgproxy.svg?branch=master)](https://travis-ci.org/andrewlouisx/pgproxy)
+[![Build Status](https://github.com/andrewlouisx/pgproxy/actions/workflows/go-test.yml/badge.svg?branch=master)](https://github.com/andrewlouisx/pgproxy/actions/workflows/go-test.yml)
 [![codecov](https://codecov.io/gh/andrewlouisx/pgproxy/branch/master/graph/badge.svg)](https://codecov.io/gh/andrewlouisx/pgproxy)
 [![GoDoc](https://godoc.org/github.com/andrewlouisx/pgproxy?status.svg)](https://godoc.org/github.com/andrewlouisx/pgproxy)
 [![Code Health](https://landscape.io/github/andrewlouisx/pgproxy/master/landscape.svg?style=flat)](https://landscape.io/github/andrewlouisx/pgproxy/master)

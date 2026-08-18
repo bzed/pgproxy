@@ -1,0 +1,143 @@
+run:
+  timeout: 5m
+  concurrency: 4
+  issues-exit-code: 1
+  tests: false
+
+linters:
+  enable:
+    - bodyclose
+    - deadcode
+    - depguard
+    - dogsled
+    - dupl
+    - errcheck
+    - exhaustive
+    - funlen
+    - gci
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - godot
+    - goerr113
+    - gofmt
+    - gofumpt
+    - goheader
+    - goimports
+    - gomnd
+    - goprintffuncname
+    - gosec
+    - gosimple
+    - govet
+    - ifshort
+    - importas
+    - ineffassign
+    - lll
+    - makezero
+    - misspell
+    - nakedret
+    - nestif
+    - nilerr
+    - nilnil
+    - nlreturn
+    - noctx
+    - nolintlint
+    - paralleltest
+    - prealloc
+    - predeclared
+    - promlint
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - structcheck
+    - stylecheck
+    - tflint
+    - thelper
+    - typecheck
+    - unconvert
+    - unparam
+    - unused
+    - varcheck
+    - whitespace
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+  gci:
+    sections:
+      - standard
+      - default
+      - prefix(github.com/andrewlouisx/pgproxy)
+    skip-generated: true
+    skip-rune-literal: true
+  gocognit:
+    min-complexity: 10
+  goconst:
+    min-len: 2
+    min-occurrences: 3
+  godot:
+    scope: all
+    exclude:
+      - "^\s+var\s+"
+    capitalize: true
+  gofmt:
+    simplify: true
+  gofumpt:
+    module-prefix: true
+    extra-rules: true
+  gomnd:
+    settings:
+      mnd:
+        ignored-numbers:
+          - "0"
+          - "1"
+          - "2"
+          - "3"
+          - "10"
+          - "100"
+          - "1000"
+  lll:
+    line-length: 120
+    tab-length: 4
+  misspell:
+    locale: US
+  nolintlint:
+    allow-leading-space: true
+    allow-unused: false
+    require-explanation: false
+    require-specific: false
+
+issues:
+  exclude-rules:
+    - linters:
+        - lll
+      source: "//go:generate"
+    - linters:
+        - dupl
+      source: "^func.*Test.*\("  
+    - linters:
+        - gosec
+      source: "G104"
+    - linters:
+        - errcheck
+      path: "_test\.go"
+      source: "(*testing\.T)\.(Error|Fatal)"
+
+severity:
+  default-severity: error
+  rules:
+    - linters:
+        - funlen
+      severity: warning
+    - linters:
+        - gocognit
+      severity: warning
+    - linters:
+        - gocyclo
+      severity: warning
+    - linters:
+        - gofumpt
+      severity: warning
