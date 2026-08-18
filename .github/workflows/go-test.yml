@@ -163,31 +163,13 @@ jobs:
         done
 
     - name: Run tests with coverage
-      run: |
-        # Run non-proxy tests (no PostgreSQL needed)
-        go test -coverprofile=coverage_nonproxy.txt -covermode=atomic ./parser/... ./cli/... ./examples/...
-        # Run proxy integration tests (PostgreSQL needed)
-        go test -coverprofile=coverage_proxy.txt -covermode=atomic -run "Test_Start|Benchmark_Start|Test_getResolvedAddresses|Test_getListener" ./proxy
-        # Merge coverage files
-        if [ -f coverage_nonproxy.txt ]; then
-          tail -n +2 coverage_nonproxy.txt >> coverage.txt
-        fi
-        if [ -f coverage_proxy.txt ]; then
-          tail -n +2 coverage_proxy.txt >> coverage.txt
-        fi
-        # Add mode line
-        echo "mode: atomic" > coverage_final.txt
-        cat coverage.txt >> coverage_final.txt
-        mv coverage_final.txt coverage.txt
+      run: go test -coverprofile=coverage.txt ./...
       timeout-minutes: 5
 
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
+    - name: Upload coverage reports to Codecov
+      uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        file: coverage.txt
-        flags: unittests
-      continue-on-error: true
 
   lint:
     name: Lint and Format Check
