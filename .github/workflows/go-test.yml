@@ -205,8 +205,7 @@ jobs:
       run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 
     - name: Run golangci-lint
-      run: golangci-lint run --config .golangci.yml ./... || true
-      continue-on-error: true
+      run: golangci-lint run --config .golangci.yml ./...
 
     - name: Check formatting
       run: |

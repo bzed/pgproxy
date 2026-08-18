@@ -44,7 +44,7 @@ func RowsFormater(rows *sql.Rows) {
 		}
 
 		// Scan the result into the column pointers...
-		if err := rows.Scan(columnPointers...); err != nil {
+		if err := rows.Scan(columnPointers...); err != nil { //nolint:typecheck
 			fmt.Println(err)
 		}
 

@@ -9,8 +9,9 @@
 ### Code Quality
 - **Always run `go vet ./...`** before committing to catch potential issues
 - **Always run `gofmt -l .`** and format any unformatted files with `gofmt -w`
+- **Always run `golangci-lint run ./...`** for additional static analysis before committing
 - **Never commit unformatted code** - the CI pipeline will reject it
-- Use `golangci-lint` for additional static analysis (config in `.golangci.yml`)
+- **Never commit code that fails golangci-lint** - the CI pipeline will reject it
 
 ### Testing
 - Run unit tests: `go test -v ./parser/... ./cli/...`
