@@ -3,7 +3,7 @@
 # pgproxy
 [![Build Status](https://github.com/bzed/pgproxy/actions/workflows/go-test.yml/badge.svg?branch=master)](https://github.com/bzed/pgproxy/actions/workflows/go-test.yml)
 [![codecov](https://codecov.io/gh/bzed/pgproxy/branch/master/graph/badge.svg)](https://codecov.io/gh/bzed/pgproxy)
-[![GoDoc](https://pkg.go.dev/github.com/bzed/pgproxy?status.svg)](https://pkg.go.dev/github.com/bzed/pgproxy)
+[![GoDoc](https://pkg.go.dev/badge/github.com/bzed/pgproxy.svg)](https://pkg.go.dev/github.com/bzed/pgproxy)
 [![Go Report Card](https://goreportcard.com/badge/github.com/bzed/pgproxy)](https://goreportcard.com/report/github.com/bzed/pgproxy)
 [![License](https://img.shields.io/badge/LICENSE-Apache2.0-ff69b4.svg)](http://www.apache.org/licenses/LICENSE-2.0.html)
 
@@ -60,7 +60,7 @@ import (
 func main() {
 	// call proxy
 	cli.Main("../pgproxy.conf", []string{"pgproxy", "start"})
-	
+
 	// Capture ctrl-c for graceful exit
 	chExit := make(chan os.Signal, 1)
 	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
