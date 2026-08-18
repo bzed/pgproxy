@@ -115,7 +115,7 @@ func saveCurrentPid() {
 	}
 	defer fout.Close()
 	// write current pid
-	fout.WriteString(strconv.Itoa(os.Getpid()))
+	_, _ = fout.WriteString(strconv.Itoa(os.Getpid()))
 }
 
 // get current pgproxy pid

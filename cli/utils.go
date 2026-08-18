@@ -37,7 +37,7 @@ type ProxyConfig struct {
 		Addr     string
 		User     string
 		Password string
-		DbName   string
+		DBName   string
 	} `toml:"DB"`
 }
 
@@ -64,5 +64,5 @@ func readConfig(file string) (pc ProxyConfig, connStr string) {
 	}
 
 	return pc, fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s application_name=pgproxy sslmode=disable",
-		master.Addr[0:sepindex], master.Addr[(sepindex+1):], master.User, master.Password, master.DbName)
+		master.Addr[0:sepindex], master.Addr[(sepindex+1):], master.User, master.Password, master.DBName)
 }

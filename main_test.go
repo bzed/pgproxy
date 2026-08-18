@@ -46,7 +46,6 @@ func TestExtractJSON(t *testing.T) {
 		name    string
 		input   string
 		want    string
-		wantErr bool
 	}{
 		{
 			name:  "Valid JSON comment",
@@ -67,11 +66,7 @@ func TestExtractJSON(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := extractJSON(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("extractJSON() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
+			got := extractJSON(tt.input)
 			if got != tt.want {
 				t.Errorf("extractJSON() = %v, want %v", got, tt.want)
 			}
@@ -89,7 +84,7 @@ func TestUnmarshalJSON(t *testing.T) {
 		{
 			name:    "Valid JSON",
 			jsonStr: `{"transaction_id": "tx-12345"}`,
-			want:    &Metadata{TransactionId: "tx-12345"},
+			want:    &Metadata{TransactionID: "tx-12345"},
 			wantErr: false,
 		},
 		{
@@ -124,7 +119,7 @@ func TestGetQueryMetadata(t *testing.T) {
 		{
 			name:    "Query with metadata",
 			input:   "SELECT * /* {\"transaction_id\": \"123\"} */ FROM table",
-			want:    &Metadata{TransactionId: "123"},
+			want:    &Metadata{TransactionID: "123"},
 			wantErr: false,
 		},
 		{

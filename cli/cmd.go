@@ -62,7 +62,6 @@ func Command() {
 		}
 		client.Request(command)
 	}
-	return
 }
 
 // Client request switcher,for different types of sql statement
