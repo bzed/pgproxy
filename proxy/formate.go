@@ -16,7 +16,7 @@ import (
 	"github.com/olekukonko/tablewriter"
 )
 
-// Parse query's results and formate it,then will be print
+// RowsFormater parses query's results and formats it, then will be printed
 // in command line such as:
 // +---------+----------------+----------+
 // |   ID    |       IP       |   NAME   |
@@ -68,7 +68,7 @@ func RowsFormater(rows *sql.Rows) {
 	}
 }
 
-// Parse exec's results and formate it,then will be print
+// ResultFormater parses exec's results and formats it, then will be printed
 // in command line such as:
 // OK, [n] rows affected
 // else error
