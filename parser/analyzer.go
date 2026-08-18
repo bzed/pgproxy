@@ -40,7 +40,7 @@ func GetPrimaryKey(sqlNode SQLNode) (*ColumnDefinition, error) {
 	return nil, errors.New("unable to find primary key")
 }
 
-//Get ColumnDefinition by name, sqlNode must be a CreateTable struct
+// Get ColumnDefinition by name, sqlNode must be a CreateTable struct
 func GetColumnByName(sqlNode SQLNode, name string) (*ColumnDefinition, error) {
 	node, ok := sqlNode.(*CreateTable)
 	if !ok {

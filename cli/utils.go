@@ -58,7 +58,7 @@ func readConfig(file string) (pc ProxyConfig, connStr string) {
 
 	master := pc.DB["master"]
 	sepindex := strings.Index(master.Addr, ":")
-	
+
 	if sepindex == -1 {
 		glog.Fatalln("Invalid database address format in configuration. Expected 'host:port'")
 	}

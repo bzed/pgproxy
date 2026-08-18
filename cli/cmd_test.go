@@ -5,5 +5,6 @@ import (
 )
 
 func Test_Command(t *testing.T) {
-	// Command()
+	// Command requires interactive terminal, skip in automated tests
+	t.Skip("Command requires interactive terminal")
 }

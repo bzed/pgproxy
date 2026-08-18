@@ -45,13 +45,13 @@ func Start(proxyHost, remoteHost string, handler Handler) {
 		connid++
 
 		p := &Proxy{
-			lconn:  conn,
-			laddr:  proxyAddr,
-			raddr:  remoteAddr,
-			erred:  false,
-			errsig: make(chan bool),
-			prefix: fmt.Sprintf("Connection #%03d ", connid),
-			connId: connid,
+			lconn:   conn,
+			laddr:   proxyAddr,
+			raddr:   remoteAddr,
+			erred:   false,
+			errsig:  make(chan bool),
+			prefix:  fmt.Sprintf("Connection #%03d ", connid),
+			connId:  connid,
 			bufPool: &bufferPool{},
 		}
 		go p.service(handler)
@@ -113,13 +113,13 @@ func (bp *bufferPool) Put(b []byte) {
 // and closes it when finished.
 func New(conn *net.TCPConn, proxyAddr, remoteAddr *net.TCPAddr, connid uint64) *Proxy {
 	return &Proxy{
-		lconn:  conn,
-		laddr:  proxyAddr,
-		raddr:  remoteAddr,
-		erred:  false,
-		errsig: make(chan bool),
-		prefix: fmt.Sprintf("Connection #%03d ", connid),
-		connId: connid,
+		lconn:   conn,
+		laddr:   proxyAddr,
+		raddr:   remoteAddr,
+		erred:   false,
+		errsig:  make(chan bool),
+		prefix:  fmt.Sprintf("Connection #%03d ", connid),
+		connId:  connid,
 		bufPool: &bufferPool{},
 	}
 }
@@ -195,11 +195,11 @@ func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Ha
 
 		msgType := buff[0]
 		msgLength := binary.BigEndian.Uint32(buff[1:5])
-		
+
 		// msgLength includes the 4 bytes of the length field
 		// So total message size = 1 (type) + 4 (length) + (msgLength - 4) = msgLength + 1
 		totalContentLength := int(msgLength) - 4
-		
+
 		if totalContentLength < 0 {
 			p.err("Invalid message length", fmt.Errorf("invalid message length: %d", msgLength))
 			return
@@ -212,7 +212,7 @@ func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Ha
 			p.bufPool.Put(buff)
 			buff = newBuff
 		}
-		
+
 		// Read the rest of the message
 		_, err = io.ReadFull(src, buff[5:5+totalContentLength])
 		if err != nil {
@@ -269,7 +269,7 @@ func (p *Proxy) handleResponseConnection(src, dst *net.TCPConn) {
 
 		msgLength := binary.BigEndian.Uint32(buff[1:5])
 		totalContentLength := int(msgLength) - 4
-		
+
 		if totalContentLength < 0 {
 			p.err("Invalid response message length", fmt.Errorf("invalid length: %d", msgLength))
 			return
@@ -303,13 +303,13 @@ func (p *Proxy) handleResponseConnection(src, dst *net.TCPConn) {
 func HandleQuery(msgType byte, content []byte, requestHandler Handler) ([]byte, error) {
 	// Remove null terminator if present
 	queryStr := string(bytes.TrimSuffix(content, []byte{0}))
-	
+
 	// Call handler with query string
 	data, err := requestHandler(queryStr)
 	if err != nil {
 		return nil, fmt.Errorf("handler error: %w", err)
 	}
-	
+
 	// If handler returns data, use it
 	if data != nil {
 		// Ensure null terminator
@@ -318,7 +318,7 @@ func HandleQuery(msgType byte, content []byte, requestHandler Handler) ([]byte, 
 		}
 		return data, nil
 	}
-	
+
 	// Return original content with null terminator
 	if len(content) == 0 || content[len(content)-1] != 0 {
 		return append(content, 0), nil

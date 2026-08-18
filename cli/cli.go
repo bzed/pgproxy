@@ -38,7 +38,7 @@ func Main(config interface{}, pargs interface{}) {
 	} else {
 		pc, connStr = readConfig(*proxyconf)
 		args = os.Args
-		fmt.Println(args)
+		fmt.Print(args)
 	}
 
 	if len(args) < 2 {
@@ -76,21 +76,20 @@ func help() {
 	fmt.Println("	info :pgproxy info.")
 }
 
-// print pgproxy infomation
+// print pgproxy information
 func info(proxyhost string) {
-	fmt.Println(Logo)
+	fmt.Print(Logo)
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "<unknown>"
 	}
 	pid := strconv.Itoa(os.Getpid())
 	starttime := time.Now().Format("2006-01-02 03:04:05 PM")
-	fmt.Println("		", VERSION)
-	fmt.Println("	Host: " + hostname)
-	fmt.Println("	Pid:", string(pid))
-	fmt.Println("	Proxy:", proxyhost)
-	fmt.Println("	Starttime:", starttime)
-	fmt.Println()
+	fmt.Printf("  %s\n", VERSION)
+	fmt.Printf("  Host: %s\n", hostname)
+	fmt.Printf("  Pid: %s\n", pid)
+	fmt.Printf("  Proxy: %s\n", proxyhost)
+	fmt.Printf("  Starttime: %s\n", starttime)
 }
 
 // set log dir

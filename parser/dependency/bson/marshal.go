@@ -319,11 +319,17 @@ func encodeMap(buf *bytes2.ChunkedWriter, key string, val reflect.Value) {
 
 // a map seems to lose the 'CanAddr' property. So if we want
 // to use a custom marshaler with a struct pointer receiver, like:
-//   func (ps *PrivateStruct) MarshalBson(buf *bytes2.ChunkedWriter, key string) {
+//
+//	func (ps *PrivateStruct) MarshalBson(buf *bytes2.ChunkedWriter, key string) {
+//
 // the map has to be using pointers, i.e:
-//   map[string]*PrivateStruct
+//
+//	map[string]*PrivateStruct
+//
 // and not:
-//   map[string]PrivateStruct
+//
+//	map[string]PrivateStruct
+//
 // (see unit test)
 func encodeMapContent(buf *bytes2.ChunkedWriter, val reflect.Value) {
 	lenWriter := NewLenWriter(buf)
