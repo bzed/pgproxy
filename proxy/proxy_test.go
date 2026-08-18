@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	testProxyHost    = "127.0.0.1:9090"
-	testRemoteHost   = "127.0.0.1:5432"
+	testProxyHost     = "127.0.0.1:9090"
+	testRemoteHost    = "127.0.0.1:5432"
 	testBenchmarkHost = "127.0.0.1:9092"
 	testListenerHost  = "127.0.0.1:9091"
 )
@@ -69,7 +69,7 @@ func Test_Start(t *testing.T) {
 	// Set timeouts for database operations
 	db.SetMaxIdleConns(1)
 	db.SetMaxOpenConns(100)
-	
+
 	// Set a timeout for the query
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
