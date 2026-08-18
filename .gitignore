@@ -37,3 +37,7 @@ pgproxy.conf.local
 # OS files
 .DS_Store
 Thumbs.db
+
+# Coverage files
+coverage.out
+coverage.txt
