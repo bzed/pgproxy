@@ -40,6 +40,10 @@ func TestQueryFilter(t *testing.T) {
 		t.Errorf("Filter unbounded update should return false")
 	}
 
+	if filter.Filter([]byte("ALTER USER bob WITH PASSWORD 'newpass'")) {
+		t.Errorf("Filter alter role should return false by default")
+	}
+
 	if filter.Filter([]byte("select * from")) {
 		t.Errorf("Filter invalid syntax should fail")
 	}
@@ -49,6 +53,7 @@ func TestQueryFilterConfig(t *testing.T) {
 	config := DefaultFilterConfig()
 	config.AllowSelect = false
 	config.RequireWhereForDelete = false
+	config.AllowAlterRole = true
 
 	filter := NewQueryFilter(config)
 
@@ -58,6 +63,10 @@ func TestQueryFilterConfig(t *testing.T) {
 
 	if !filter.Filter([]byte("delete from a")) {
 		t.Errorf("Filter should allow unbounded delete when RequireWhereForDelete is false")
+	}
+
+	if !filter.Filter([]byte("ALTER ROLE bob WITH PASSWORD 'newpass'")) {
+		t.Errorf("Filter should allow alter role when AllowAlterRole is true")
 	}
 }
 

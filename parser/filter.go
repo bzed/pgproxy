@@ -20,6 +20,7 @@ type FilterConfig struct {
 	AllowUpdate           bool `toml:"allow_update"`
 	AllowDelete           bool `toml:"allow_delete"`
 	AllowTruncate         bool `toml:"allow_truncate"`
+	AllowAlterRole        bool `toml:"allow_alter_role"`
 	RequireWhereForUpdate bool `toml:"require_where_for_update"`
 	RequireWhereForDelete bool `toml:"require_where_for_delete"`
 
@@ -35,6 +36,7 @@ func DefaultFilterConfig() FilterConfig {
 		AllowUpdate:           true,
 		AllowDelete:           true,
 		AllowTruncate:         false,
+		AllowAlterRole:        false,
 		RequireWhereForUpdate: true,
 		RequireWhereForDelete: true,
 	}
@@ -107,6 +109,10 @@ func (f *QueryFilter) Filter(str []byte) bool {
 			}
 		case *tree.Truncate:
 			if !f.config.AllowTruncate {
+				return false
+			}
+		case *tree.AlterRole:
+			if !f.config.AllowAlterRole {
 				return false
 			}
 		}
