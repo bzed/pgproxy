@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -10,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+
+	"github.com/lib/pq/scram"
 )
 
 // DBConfig holds the configuration for a target database
@@ -141,6 +144,7 @@ func connectBackend(db DBConfig) (net.Conn, error) {
 	}
 
 	// 3. Handle Authentication
+	var saslClient *scram.Client
 	for {
 		var header [5]byte
 		if _, err := io.ReadFull(conn, header[:]); err != nil {
@@ -174,6 +178,60 @@ func connectBackend(db DBConfig) (net.Conn, error) {
 			} else if authType == 3 { // Cleartext
 				conn.Close()
 				return nil, errors.New("cleartext authentication is not supported")
+			} else if authType == 10 { // SASL
+				// Assume SCRAM-SHA-256 is supported by the server and pick it.
+				// The payload contains a list of supported mechanisms, but we hardcode SCRAM-SHA-256.
+				saslClient = scram.NewClient(sha256.New, db.User, db.Password)
+				saslClient.Step(nil)
+				clientOut := saslClient.Out()
+
+				mech := "SCRAM-SHA-256"
+				msgLen := 4 + len(mech) + 1 + 4 + len(clientOut)
+				resp := make([]byte, 1+msgLen)
+				resp[0] = 'p'
+				binary.BigEndian.PutUint32(resp[1:5], uint32(msgLen))
+				copy(resp[5:], mech)
+				resp[5+len(mech)] = 0
+				binary.BigEndian.PutUint32(resp[5+len(mech)+1:5+len(mech)+5], uint32(len(clientOut)))
+				copy(resp[5+len(mech)+5:], clientOut)
+
+				if _, err := conn.Write(resp); err != nil {
+					conn.Close()
+					return nil, err
+				}
+			} else if authType == 11 { // SASLContinue
+				if saslClient == nil {
+					conn.Close()
+					return nil, errors.New("unexpected SASLContinue")
+				}
+				serverFirstMessage := payload[4:]
+				saslClient.Step(serverFirstMessage)
+				if err := saslClient.Err(); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				clientOut := saslClient.Out()
+				msgLen := 4 + len(clientOut)
+				resp := make([]byte, 1+msgLen)
+				resp[0] = 'p'
+				binary.BigEndian.PutUint32(resp[1:5], uint32(msgLen))
+				copy(resp[5:], clientOut)
+
+				if _, err := conn.Write(resp); err != nil {
+					conn.Close()
+					return nil, err
+				}
+			} else if authType == 12 { // SASLFinal
+				if saslClient == nil {
+					conn.Close()
+					return nil, errors.New("unexpected SASLFinal")
+				}
+				serverFinalMessage := payload[4:]
+				saslClient.Step(serverFinalMessage)
+				if err := saslClient.Err(); err != nil {
+					conn.Close()
+					return nil, err
+				}
 			} else if authType == 5 { // MD5
 				salt := payload[4:8]
 				hash := computeMD5(db.Password, db.User, salt)
