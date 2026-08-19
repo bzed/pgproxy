@@ -7,11 +7,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"runtime"
 
 	"github.com/jackc/pgmock"
 	"github.com/jackc/pgproto3/v2"
@@ -856,7 +856,7 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to connect: %v", err)
 		}
-		
+
 		performMockStartup(conn)
 
 		queryMsg = createMockQueryMessage(query)
@@ -925,7 +925,7 @@ func TestProxyWithUnixSocket(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix sockets are not supported on Windows")
 	}
-	
+
 	backendSocket := "/tmp/pgproxy_test_backend.sock"
 	proxySocket := "/tmp/pgproxy_test_proxy.sock"
 
