@@ -27,34 +27,35 @@ func TestReturnHandler(t *testing.T) {
 
 func TestFilter(t *testing.T) {
 	// Filter calls Parse
-	validSelect := Filter([]byte("select a from b"))
-	if !validSelect {
+	if !Filter([]byte("select a from b")) {
 		t.Errorf("Filter valid select failed")
 	}
 
-	invalidSelect := Filter([]byte("select * from b"))
-	if invalidSelect {
+	if Filter([]byte("select * from b")) {
 		t.Errorf("Filter select * should return false")
 	}
 
-	validDelete := Filter([]byte("delete from a limit 10"))
-	if !validDelete {
-		t.Errorf("Filter delete failed")
+	if !Filter([]byte("delete from a where id = 1")) {
+		t.Errorf("Filter delete with where failed")
 	}
 
-	validInsert := Filter([]byte("insert into a(id) values(1)"))
-	if !validInsert {
-		// Just log, we don't care if vitess doesn't support this specific insert syntax
-		// t.Errorf("Filter insert failed")
+	if Filter([]byte("delete from a")) {
+		t.Errorf("Filter unbounded delete should return false")
 	}
 
-	validUpdate := Filter([]byte("update a set b=1"))
-	if !validUpdate {
-		t.Errorf("Filter update failed")
+	if !Filter([]byte("insert into a(id) values(1)")) {
+		t.Errorf("Filter insert failed")
 	}
 
-	invalidSyntax := Filter([]byte("select * from"))
-	if invalidSyntax {
+	if !Filter([]byte("update a set b=1 where id = 1")) {
+		t.Errorf("Filter bounded update failed")
+	}
+
+	if Filter([]byte("update a set b=1")) {
+		t.Errorf("Filter unbounded update should return false")
+	}
+
+	if Filter([]byte("select * from")) {
 		t.Errorf("Filter invalid syntax should fail")
 	}
 }
