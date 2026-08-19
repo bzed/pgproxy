@@ -24,8 +24,8 @@ func main() {
 			DBName:   "analytics_db",
 		},
 	}
-	
-	// Start proxy on port 5433, connections to database "primary" 
+
+	// Start proxy on port 5433, connections to database "primary"
 	// will route to localhost:5432, while "analytics" routes to 10.0.0.5
 	proxy.Start(
 		"localhost:5433",

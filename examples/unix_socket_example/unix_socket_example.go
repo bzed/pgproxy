@@ -18,7 +18,7 @@ func main() {
 			DBName:   "postgres",
 		},
 	}
-	
+
 	// Listen on a Unix socket instead of TCP
 	proxy.Start(
 		"/tmp/.s.PGSQL.5433",
