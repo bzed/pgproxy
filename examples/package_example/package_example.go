@@ -26,7 +26,7 @@ func main() {
 		},
 	)
 
-	// 捕获ctrl-c,平滑退出
+	// Catch ctrl-c to exit gracefully
 	chExit := make(chan os.Signal, 1)
 	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	select {
