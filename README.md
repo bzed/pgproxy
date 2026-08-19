@@ -42,7 +42,7 @@ Note: You can use it as you would with a native command line.
 
 ### Be called as a package
 
-[package_example](https://github.com/bzed/pgproxy/blob/master/examples/package_example.go)
+[package_example](https://github.com/bzed/pgproxy/blob/master/examples/package_example/package_example.go)
 
 ```
 package main
@@ -73,15 +73,10 @@ func main() {
 
 ## SQL Support
 
-Supports SELECT, DELETE, UPDATE statements in any case.
+pgproxy uses [postgresql-parser](https://github.com/auxten/postgresql-parser), a robust SQL parser extracted from CockroachDB. This provides comprehensive, native support for PostgreSQL syntax, data types, and keywords, making it far superior to legacy MySQL-based parsers.
 
-### SQL Standard Support:
-
-The parser is forked from vitess's [sqlparser](https://github.com/youtube/vitess/tree/master/go/vt/sqlparser) of YouTube.
-
-In pgproxy, database tables are like MySQL(5.6,5.7) relational tables, and you can use relational modeling schemes (normalization) to structure your schema. It supports almost all MySQL(5.6,5.7) scalar data types. It also provides full SQL support within a shard, including JOIN statements. Some PostgreSQL operations are not supported; detail see [supported types and keywords](https://github.com/bzed/pgproxy/blob/master/parser/token.go#L37).
-
+Supports parsing and rewriting for a broad array of PostgreSQL statements including `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and many advanced SQL operations.
 
 ## Credits
 
-Package parser is based on [sqlparser](https://github.com/xwb1989/sqlparser)
+Package parser utilizes [postgresql-parser](https://github.com/auxten/postgresql-parser) (derived from CockroachDB's parsing engine).
