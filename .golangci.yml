@@ -27,10 +27,6 @@ linters-settings:
     locale: US
 
 issues:
-  exclude-dirs:
-    - parser
-  exclude-files:
-    - parser/sql\.go
   exclude-rules:
     - linters:
         - lll
