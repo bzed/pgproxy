@@ -60,3 +60,39 @@ func TestQueryFilterConfig(t *testing.T) {
 		t.Errorf("Filter should allow unbounded delete when RequireWhereForDelete is false")
 	}
 }
+
+func TestQueryFilterSignatures(t *testing.T) {
+	config := DefaultFilterConfig()
+	config.BlockSignatures = []string{
+		"SELECT * FROM users WHERE (id = _) AND (name = _)",
+	}
+
+	filter := NewQueryFilter(config)
+
+	// Blocked by signature
+	if filter.Filter([]byte("SELECT * FROM users WHERE id = 123 AND name = 'alice'")) {
+		t.Errorf("Filter should block query matching BlockSignatures")
+	}
+	if filter.Filter([]byte("SELECT * FROM users WHERE id = 456 AND name = 'bob'")) {
+		t.Errorf("Filter should block query matching BlockSignatures regardless of literals")
+	}
+
+	// Allowed because signature differs
+	if !filter.Filter([]byte("SELECT * FROM users WHERE id = 123")) {
+		t.Errorf("Filter should allow queries with different signatures")
+	}
+
+	// Test AllowSignatures strictly
+	config2 := DefaultFilterConfig()
+	config2.AllowSignatures = []string{
+		"SELECT id FROM allowed_table",
+	}
+	filter2 := NewQueryFilter(config2)
+
+	if !filter2.Filter([]byte("SELECT id FROM allowed_table")) {
+		t.Errorf("Filter should allow query in AllowSignatures")
+	}
+	if filter2.Filter([]byte("SELECT id, name FROM allowed_table")) {
+		t.Errorf("Filter should block query NOT in AllowSignatures when AllowSignatures is populated")
+	}
+}

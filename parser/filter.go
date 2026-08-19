@@ -22,6 +22,9 @@ type FilterConfig struct {
 	AllowTruncate         bool `toml:"allow_truncate"`
 	RequireWhereForUpdate bool `toml:"require_where_for_update"`
 	RequireWhereForDelete bool `toml:"require_where_for_delete"`
+
+	BlockSignatures []string `toml:"block_signatures"`
+	AllowSignatures []string `toml:"allow_signatures"`
 }
 
 // DefaultFilterConfig returns a secure default configuration.
@@ -57,6 +60,28 @@ func (f *QueryFilter) Filter(str []byte) bool {
 	}
 
 	for _, stmt := range stmts {
+		// Signature-based filtering
+		sig := tree.AsStringWithFlags(stmt.AST, tree.FmtHideConstants)
+
+		for _, b := range f.config.BlockSignatures {
+			if sig == b {
+				return false
+			}
+		}
+
+		if len(f.config.AllowSignatures) > 0 {
+			allowed := false
+			for _, a := range f.config.AllowSignatures {
+				if sig == a {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return false
+			}
+		}
+
 		switch ast := stmt.AST.(type) {
 		case *tree.Select:
 			if !f.config.AllowSelect {
