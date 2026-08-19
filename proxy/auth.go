@@ -172,15 +172,8 @@ func connectBackend(db DBConfig) (net.Conn, error) {
 				// But we've already consumed it from the socket.
 				return &peekedConn{Conn: conn, peeked: append(header[:], payload...)}, nil
 			} else if authType == 3 { // Cleartext
-				pwdMsg := make([]byte, 5+len(db.Password)+1)
-				pwdMsg[0] = 'p'
-				binary.BigEndian.PutUint32(pwdMsg[1:5], uint32(len(db.Password)+5))
-				copy(pwdMsg[5:], db.Password)
-				pwdMsg[len(pwdMsg)-1] = 0
-				if _, err := conn.Write(pwdMsg); err != nil {
-					conn.Close()
-					return nil, err
-				}
+				conn.Close()
+				return nil, errors.New("cleartext authentication is not supported")
 			} else if authType == 5 { // MD5
 				salt := payload[4:8]
 				hash := computeMD5(db.Password, db.User, salt)
