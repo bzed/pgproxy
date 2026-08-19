@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bzed/pgproxy/parser"
+	pgparser "github.com/auxten/postgresql-parser/pkg/sql/parser"
 	"github.com/bzed/pgproxy/proxy"
 )
 
@@ -41,7 +41,7 @@ func loggingHandler(query string) ([]byte, error) {
 	// Call to satisfy linter for unused code
 	_, _ = getQueryMetadata(query)
 
-	statement, err := parser.Parse(query)
+	statement, err := pgparser.Parse(query)
 	if err != nil {
 		fmt.Println("Parse error:", err)
 		// Return original query on parse error
@@ -52,7 +52,7 @@ func loggingHandler(query string) ([]byte, error) {
 
 	// Rebuild the query from the parsed statement
 	// This can be used to normalize or rewrite the query
-	rewrittenQuery := parser.String(statement)
+	rewrittenQuery := statement.String()
 	fmt.Println("Rewritten query:", rewrittenQuery)
 
 	// Example: Replace table names
