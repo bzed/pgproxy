@@ -1,0 +1,24 @@
+[Unit]
+Description=pgproxy - PostgreSQL proxy server
+After=network.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/pgproxy start -c /etc/pgproxy/pgproxy.conf
+Restart=on-failure
+
+# Security hardening
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target

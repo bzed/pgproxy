@@ -43,6 +43,8 @@ pgproxy is configured using a TOML file (default: `pgproxy.conf`).
 
 ```toml
 [ServerConfig]
+    # The address and port pgproxy listens on for incoming connections
+    # You can also listen on a unix socket: ProxyAddr = "/tmp/.s.PGSQL.5432"
     ProxyAddr = "127.0.0.1:9090"
 
 [DB]
@@ -50,7 +52,19 @@ pgproxy is configured using a TOML file (default: `pgproxy.conf`).
         Addr = "127.0.0.1:5432"
         User = "postgres"
         Password = "testpass"
-        DbName = "testdb"
+        DBName = "testdb"
+        
+    [DB.reports]
+        Addr = "10.0.0.5:5432"
+        User = "reportuser"
+        Password = "reportpassword"
+        DBName = "reportsdb"
+
+    [DB.local_socket]
+        Addr = "/var/run/postgresql/.s.PGSQL.5432" # Connect to backend via Unix Socket
+        User = "postgres"
+        Password = "secretpassword"
+        DBName = "postgres"
 
 [Filter]
     allow_select = true
@@ -96,7 +110,23 @@ func main() {
 		fmt.Println("Example EXITING...Bye.")
 	}
 }
+```
 
+Check the [`examples/`](https://github.com/bzed/pgproxy/tree/master/examples) directory for more use cases:
+- `client_example`: Basic PostgreSQL connection and querying through pgproxy.
+- `package_example`: Standard proxy startup embedded within Go code.
+- `multi_db_example`: Example of configuring pgproxy to route clients dynamically to multiple disparate PostgreSQL instances based on the requested database name.
+- `unix_socket_example`: Demonstrates how to host pgproxy locally over a Unix Socket for enhanced security, bypassing TCP completely.
+
+### Systemd Deployment
+
+A ready-to-use systemd service file is provided in `systemd/pgproxy.service`. This file employs modern systemd security recommendations (running as `postgres:postgres`, `ProtectSystem=full`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, etc.) to run pgproxy securely in production.
+
+To deploy:
+```bash
+sudo cp systemd/pgproxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pgproxy
 ```
 
 ## SQL Support
