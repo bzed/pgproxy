@@ -32,6 +32,10 @@ func Benchmark_Start(b *testing.B) {
 	}
 	defer db.Close()
 
+	if err := db.Ping(); err != nil {
+		b.Skip("Database ping failed:", err)
+	}
+
 	db.SetMaxIdleConns(1)
 	db.SetMaxOpenConns(100)
 
@@ -64,6 +68,10 @@ func Test_Start(t *testing.T) {
 		t.Skip("Database connection failed:", err)
 	}
 	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Skip("Database ping failed:", err)
+	}
 
 	// Set timeouts for database operations
 	db.SetMaxIdleConns(1)
