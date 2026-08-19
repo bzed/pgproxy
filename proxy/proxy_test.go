@@ -102,5 +102,22 @@ func Test_Start(t *testing.T) {
 }
 
 func Test_getListener(t *testing.T) {
-	getListener(testListenerHost)
+	// Test TCP listener
+	l1 := getListener(testListenerHost)
+	if l1 == nil {
+		t.Fatal("Failed to get TCP listener")
+	}
+	l1.Close()
+
+	// Test Unix listener
+	sockPath := "/tmp/test_pgproxy.sock"
+	l2 := getListener(sockPath)
+	if l2 == nil {
+		t.Fatal("Failed to get Unix listener")
+	}
+	defer l2.Close()
+
+	if l2.Addr().Network() != "unix" {
+		t.Errorf("Expected unix network, got %s", l2.Addr().Network())
+	}
 }

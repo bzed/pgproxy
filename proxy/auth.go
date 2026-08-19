@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 
 	"github.com/lib/pq/scram"
 )
@@ -111,7 +112,16 @@ func buildStartupMessage(params map[string]string, user, dbname string) []byte {
 // connectBackend connects to the backend database, handles SSL and Authentication,
 // and leaves the connection in a state ready to be piped to the client.
 func connectBackend(db DBConfig) (net.Conn, error) {
-	conn, err := net.Dial("tcp", db.Addr)
+	network := "tcp"
+	addr := db.Addr
+	if strings.HasPrefix(addr, "/") {
+		network = "unix"
+	} else if strings.HasPrefix(addr, "unix:") {
+		network = "unix"
+		addr = strings.TrimPrefix(addr, "unix:")
+	}
+
+	conn, err := net.Dial(network, addr)
 	if err != nil {
 		return nil, err
 	}

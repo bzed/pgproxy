@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -913,4 +914,90 @@ func performMockStartup(conn net.Conn) error {
 	resp := make([]byte, 9+6)
 	_, err = io.ReadFull(conn, resp)
 	return err
+}
+
+// NewMockPgServerUnix creates a new mock PostgreSQL server on a Unix socket
+func NewMockPgServerUnix(socketPath string) (*MockPgServer, error) {
+	// Remove the socket file if it already exists
+	os.Remove(socketPath)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, err
+	}
+	return &MockPgServer{
+		listener:  listener,
+		queries:   make([]string, 0),
+		closeChan: make(chan struct{}),
+	}, nil
+}
+
+// TestProxyWithUnixSocket tests the proxy listening on a Unix socket and connecting to a backend via Unix socket
+func TestProxyWithUnixSocket(t *testing.T) {
+	backendSocket := "/tmp/pgproxy_test_backend.sock"
+	proxySocket := "/tmp/pgproxy_test_proxy.sock"
+
+	mock, err := NewMockPgServerUnix(backendSocket)
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	defer os.Remove(backendSocket)
+
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Clean up any old proxy socket
+	os.Remove(proxySocket)
+
+	dbs := map[string]DBConfig{
+		"testdb": {
+			Addr:     backendSocket,
+			User:     "postgres",
+			Password: "testpass",
+			DBName:   "testdb",
+		},
+	}
+
+	handler := func(query string) ([]byte, error) {
+		return nil, nil // passthrough
+	}
+
+	go Start(proxySocket, dbs, handler)
+	time.Sleep(100 * time.Millisecond)
+	defer os.Remove(proxySocket)
+
+	// Connect to proxy via unix socket
+	conn, err := net.Dial("unix", proxySocket)
+	if err != nil {
+		t.Fatalf("Failed to connect to proxy socket: %v", err)
+	}
+	defer conn.Close()
+
+	// Perform mock startup
+	err = performMockStartup(conn)
+	if err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	// Send a simple query
+	queryMsg := createMockQueryMessage("SELECT 1")
+	_, err = conn.Write(queryMsg)
+	if err != nil {
+		t.Fatalf("Failed to write query: %v", err)
+	}
+
+	// Read responses
+	buf := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for i := 0; i < 5; i++ {
+		_, err = conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	queries := mock.QueriesReceived()
+	if len(queries) != 1 || queries[0] != "SELECT 1" {
+		t.Errorf("Expected mock to receive 'SELECT 1', got %v", queries)
+	}
 }
