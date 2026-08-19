@@ -14,7 +14,8 @@ import (
 	"net"
 	"strings"
 	"sync"
-
+	
+	"github.com/jackc/pgproto3/v2"
 	"github.com/golang/glog"
 )
 
@@ -168,19 +169,11 @@ func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
 }
 
 func buildErrorResponse(severity, message string) []byte {
-	var buf bytes.Buffer
-	buf.Write([]byte{'E', 0, 0, 0, 0})
-	buf.WriteByte('S')
-	buf.WriteString(severity)
-	buf.WriteByte(0)
-	buf.WriteByte('M')
-	buf.WriteString(message)
-	buf.WriteByte(0)
-	buf.WriteByte(0)
-
-	out := buf.Bytes()
-	binary.BigEndian.PutUint32(out[1:5], uint32(len(out)-1))
-	return out
+	errResp := &pgproto3.ErrorResponse{
+		Severity: severity,
+		Message:  message,
+	}
+	return errResp.Encode(nil)
 }
 
 // PostgreSQL message types

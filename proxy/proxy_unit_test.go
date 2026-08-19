@@ -214,3 +214,27 @@ func TestIsQueryMessage(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildErrorResponse(t *testing.T) {
+	resp := buildErrorResponse("FATAL", "test error message")
+
+	// The response should be a valid pgproto3.ErrorResponse message
+	// It should start with 'E'
+	if len(resp) < 5 || resp[0] != 'E' {
+		t.Fatalf("Expected response to start with 'E', got %v", resp)
+	}
+
+	// Check the length (bytes 1-4)
+	length := binary.BigEndian.Uint32(resp[1:5])
+	if int(length) != len(resp)-1 {
+		t.Errorf("Expected length %d, got %d", len(resp)-1, length)
+	}
+
+	// Verify it contains the severity and message
+	if !bytes.Contains(resp, []byte("FATAL")) {
+		t.Errorf("Expected response to contain 'FATAL'")
+	}
+	if !bytes.Contains(resp, []byte("test error message")) {
+		t.Errorf("Expected response to contain 'test error message'")
+	}
+}
