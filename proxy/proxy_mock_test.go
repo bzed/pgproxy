@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"runtime"
 
 	"github.com/jackc/pgmock"
 	"github.com/jackc/pgproto3/v2"
@@ -855,6 +856,8 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to connect: %v", err)
 		}
+		
+		performMockStartup(conn)
 
 		queryMsg = createMockQueryMessage(query)
 		_, err = conn.Write(queryMsg)
@@ -882,22 +885,14 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 
 // Helper to perform startup sequence with the proxy
 func performMockStartup(conn net.Conn) error {
-	params := map[string]string{
-		"user":     "postgres",
-		"database": "testdb",
+	sm := &pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters: map[string]string{
+			"user":     "postgres",
+			"database": "testdb",
+		},
 	}
-	var buf bytes.Buffer
-	buf.Write([]byte{0, 0, 0, 0}) // length placeholder
-	buf.Write([]byte{0, 3, 0, 0}) // version 3.0
-	for k, v := range params {
-		buf.WriteString(k)
-		buf.WriteByte(0)
-		buf.WriteString(v)
-		buf.WriteByte(0)
-	}
-	buf.WriteByte(0)
-	out := buf.Bytes()
-	binary.BigEndian.PutUint32(out[:4], uint32(len(out)))
+	out := sm.Encode(nil)
 
 	_, err := conn.Write(out)
 	if err != nil {
@@ -927,6 +922,10 @@ func NewMockPgServerUnix(socketPath string) (*MockPgServer, error) {
 
 // TestProxyWithUnixSocket tests the proxy listening on a Unix socket and connecting to a backend via Unix socket
 func TestProxyWithUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets are not supported on Windows")
+	}
+	
 	backendSocket := "/tmp/pgproxy_test_backend.sock"
 	proxySocket := "/tmp/pgproxy_test_proxy.sock"
 
