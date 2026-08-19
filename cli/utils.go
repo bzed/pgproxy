@@ -14,6 +14,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/bzed/pgproxy/parser"
+	"github.com/bzed/pgproxy/proxy"
 	"github.com/golang/glog"
 )
 
@@ -34,13 +35,8 @@ type ProxyConfig struct {
 	ServerConfig struct {
 		ProxyAddr string
 	}
-	DB map[string]struct {
-		Addr     string
-		User     string
-		Password string
-		DBName   string
-	} `toml:"DB"`
-	FilterConfig parser.FilterConfig `toml:"Filter"`
+	DB           map[string]proxy.DBConfig `toml:"DB"`
+	FilterConfig parser.FilterConfig       `toml:"Filter"`
 }
 
 func readConfig(file string) (pc ProxyConfig, connStr string) {

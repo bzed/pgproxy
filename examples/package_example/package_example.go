@@ -6,12 +6,25 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/bzed/pgproxy/cli"
+	"github.com/bzed/pgproxy/proxy"
 )
 
 func main() {
-	// call proxy
-	cli.Main("../pgproxy.json", []string{"pgproxy", "start"})
+	dbs := map[string]proxy.DBConfig{
+		"testdb": {
+			Addr:     "localhost:5432",
+			User:     "postgres",
+			Password: "mysecretpassword",
+			DBName:   "postgres",
+		},
+	}
+	proxy.Start(
+		"localhost:5433",
+		dbs,
+		func(query string) ([]byte, error) {
+			return nil, nil
+		},
+	)
 
 	// 捕获ctrl-c,平滑退出
 	chExit := make(chan os.Signal, 1)

@@ -53,7 +53,7 @@ func Main(config interface{}, pargs interface{}) {
 			// Start the proxy with the configured filter handler
 			go func() {
 				queryFilter := parser.NewQueryFilter(pc.FilterConfig)
-				proxy.Start(pc.ServerConfig.ProxyAddr, pc.DB["master"].Addr, queryFilter.Handler)
+				proxy.Start(pc.ServerConfig.ProxyAddr, pc.DB, queryFilter.Handler)
 			}()
 			glog.Infoln("Started pgproxy successfully.")
 		} else if args[1] == "cli" {

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/golang/glog"
@@ -25,19 +26,15 @@ var (
 // request or sql. Receives the query string and returns modified bytes.
 type Handler func(query string) ([]byte, error)
 
-// Start proxy server needed receive  and proxyHost, all
-// the request or database's sql of receive will redirect
-// to remoteHost.
-func Start(proxyHost, remoteHost string, handler Handler) {
+// Start proxy server needed receive proxyHost, and database configs
+func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) {
 	defer glog.Flush()
-	glog.Infof("Proxying from %v to %v\n", proxyHost, remoteHost)
+	glog.Infof("Proxying from %v with %d configured databases\n", proxyHost, len(dbs))
 
-	proxyAddr := getResolvedAddresses(proxyHost)
-	remoteAddr := getResolvedAddresses(remoteHost)
-	listener := getListener(proxyAddr)
+	listener := getListener(proxyHost)
 
 	for {
-		conn, err := listener.AcceptTCP()
+		conn, err := listener.Accept()
 		if err != nil {
 			glog.Errorf("Failed to accept connection '%s'\n", err)
 			continue
@@ -46,40 +43,35 @@ func Start(proxyHost, remoteHost string, handler Handler) {
 
 		p := &Proxy{
 			lconn:   conn,
-			laddr:   proxyAddr,
-			raddr:   remoteAddr,
 			erred:   false,
 			errsig:  make(chan bool),
 			prefix:  fmt.Sprintf("Connection #%03d ", connid),
 			connID:  connid,
 			bufPool: &bufferPool{},
 		}
-		go p.service(handler)
+		go p.service(dbs, handler)
 	}
 }
 
-// ResolvedAddresses of host.
-func getResolvedAddresses(host string) *net.TCPAddr {
-	addr, err := net.ResolveTCPAddr("tcp", host)
-	if err != nil {
-		glog.Fatalln("ResolveTCPAddr of host:", err)
+// Listener of a net.Addr.
+func getListener(host string) net.Listener {
+	var listener net.Listener
+	var err error
+	if strings.HasPrefix(host, "/") || strings.HasPrefix(host, "unix:") {
+		host = strings.TrimPrefix(host, "unix:")
+		listener, err = net.Listen("unix", host)
+	} else {
+		listener, err = net.Listen("tcp", host)
 	}
-	return addr
-}
-
-// Listener of a net.TCPAddr.
-func getListener(addr *net.TCPAddr) *net.TCPListener {
-	listener, err := net.ListenTCP("tcp", addr)
 	if err != nil {
-		glog.Fatalf("ListenTCP of %s error:%v", addr, err)
+		glog.Fatalf("Listen on %s error:%v", host, err)
 	}
 	return listener
 }
 
 // Proxy - Manages a Proxy connection, piping data between proxy and remote.
 type Proxy struct {
-	laddr, raddr *net.TCPAddr
-	lconn, rconn *net.TCPConn
+	lconn, rconn net.Conn
 	erred        bool
 	errsig       chan bool
 	prefix       string
@@ -109,11 +101,9 @@ func (bp *bufferPool) Put(b []byte) {
 
 // New - Create a new Proxy instance. Takes over local connection passed in,
 // and closes it when finished.
-func New(conn *net.TCPConn, proxyAddr, remoteAddr *net.TCPAddr, connid uint64) *Proxy {
+func New(conn net.Conn, connid uint64) *Proxy {
 	return &Proxy{
 		lconn:   conn,
-		laddr:   proxyAddr,
-		raddr:   remoteAddr,
 		erred:   false,
 		errsig:  make(chan bool),
 		prefix:  fmt.Sprintf("Connection #%03d ", connid),
@@ -135,21 +125,62 @@ func (p *Proxy) err(s string, err error) {
 }
 
 // Proxy.service open connection to remote and service proxying data.
-func (p *Proxy) service(handler Handler) {
+func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
 	defer p.lconn.Close()
-	// connect to remote server
-	rconn, err := net.DialTCP("tcp", nil, p.raddr)
+
+	// 1. Read StartupMessage from client
+	params, _, err := readStartupMessage(p.lconn)
 	if err != nil {
+		p.err("Failed to read startup message: %s", err)
+		return
+	}
+	if params == nil {
+		p.err("Unsupported cancel request or empty startup", nil)
+		return
+	}
+
+	dbName := params["database"]
+	dbConf, ok := dbs[dbName]
+	if !ok {
+		errResp := buildErrorResponse("FATAL", "database not found in proxy config: "+dbName)
+		_, _ = p.lconn.Write(errResp)
+		p.err("Database not configured: "+dbName, nil)
+		return
+	}
+
+	// 2. Connect to backend and handle auth
+	rconn, err := connectBackend(dbConf)
+	if err != nil {
+		errResp := buildErrorResponse("FATAL", "backend connection failed: "+err.Error())
+		_, _ = p.lconn.Write(errResp)
 		p.err("Remote connection failed: %s", err)
 		return
 	}
 	p.rconn = rconn
 	defer p.rconn.Close()
+
 	// proxying data
 	go p.handleIncomingConnection(p.lconn, p.rconn, handler)
 	go p.handleResponseConnection(p.rconn, p.lconn)
+
 	// wait for close...
 	<-p.errsig
+}
+
+func buildErrorResponse(severity, message string) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{'E', 0, 0, 0, 0})
+	buf.WriteByte('S')
+	buf.WriteString(severity)
+	buf.WriteByte(0)
+	buf.WriteByte('M')
+	buf.WriteString(message)
+	buf.WriteByte(0)
+	buf.WriteByte(0)
+
+	out := buf.Bytes()
+	binary.BigEndian.PutUint32(out[1:5], uint32(len(out)-1))
+	return out
 }
 
 // PostgreSQL message types
@@ -174,7 +205,7 @@ func isQueryMessage(msgType byte) bool {
 }
 
 // Proxy.handleIncomingConnection processes incoming client messages
-func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Handler) {
+func (p *Proxy) handleIncomingConnection(src, dst net.Conn, customHandler Handler) {
 	buff := p.bufPool.Get()
 	defer p.bufPool.Put(buff)
 
@@ -272,7 +303,7 @@ func (p *Proxy) handleIncomingConnection(src, dst *net.TCPConn, customHandler Ha
 }
 
 // Proxy.handleResponseConnection forwards server responses to client
-func (p *Proxy) handleResponseConnection(src, dst *net.TCPConn) {
+func (p *Proxy) handleResponseConnection(src, dst net.Conn) {
 	// Server -> Client messages do not need to be parsed by this proxy.
 	// A simple io.Copy prevents deadlocks with 1-byte responses like SSLRequest's 'S' or 'N'.
 	_, err := io.Copy(dst, src)

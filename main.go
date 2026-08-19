@@ -24,9 +24,17 @@ import (
 
 func main() {
 	// Create a new pgproxy instance
+	dbs := map[string]proxy.DBConfig{
+		"testdb": {
+			Addr:     "localhost:5432",
+			User:     "postgres",
+			Password: "testpass",
+			DBName:   "testdb",
+		},
+	}
 	proxy.Start(
 		"localhost:5433",
-		"localhost:5432",
+		dbs,
 		loggingHandler,
 	)
 }

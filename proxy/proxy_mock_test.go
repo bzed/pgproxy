@@ -98,31 +98,67 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	defer m.closeWg.Done()
 
+	isStartup := true
 	for {
-		// Read message header (5 bytes: type + 4 byte length)
-		header := make([]byte, 5)
-		_, err := io.ReadFull(conn, header)
-		if err != nil {
-			return
-		}
+		var msgType byte
+		var contentLength int
+		var content []byte
 
-		msgType := header[0]
-		msgLength := binary.BigEndian.Uint32(header[1:5])
-		contentLength := int(msgLength) - 4
+		if isStartup {
+			// Read 4 byte length
+			lenBuf := make([]byte, 4)
+			_, err := io.ReadFull(conn, lenBuf)
+			if err != nil {
+				return
+			}
+			msgLength := binary.BigEndian.Uint32(lenBuf)
+			contentLength = int(msgLength) - 4
+			content = make([]byte, contentLength)
+			if contentLength > 0 {
+				_, err = io.ReadFull(conn, content)
+				if err != nil {
+					return
+				}
+			}
 
-		if contentLength < 0 {
-			return
-		}
+			// Check if SSLRequest
+			code := binary.BigEndian.Uint32(content[:4])
+			if code == 80877103 {
+				conn.Write([]byte{'N'}) // Deny SSL
+				continue
+			}
 
-		// Read content
-		content := make([]byte, contentLength)
-		_, err = io.ReadFull(conn, content)
-		if err != nil {
-			return
+			isStartup = false
+			msgType = 0 // StartupMessage
+		} else {
+			header := make([]byte, 5)
+			_, err := io.ReadFull(conn, header)
+			if err != nil {
+				return
+			}
+			msgType = header[0]
+			msgLength := binary.BigEndian.Uint32(header[1:5])
+			contentLength = int(msgLength) - 4
+			if contentLength < 0 {
+				return
+			}
+			content = make([]byte, contentLength)
+			if contentLength > 0 {
+				_, err = io.ReadFull(conn, content)
+				if err != nil {
+					return
+				}
+			}
 		}
 
 		// Process based on message type
 		switch msgType {
+		case 0: // StartupMessage
+			// Send AuthOk
+			conn.Write([]byte{'R', 0, 0, 0, 8, 0, 0, 0, 0})
+			// Send ReadyForQuery
+			conn.Write([]byte{'Z', 0, 0, 0, 5, 'I'})
+
 		case 'Q': // SimpleQuery
 			// Extract query string (remove null terminator)
 			query := string(bytes.TrimSuffix(content, []byte{0}))
@@ -180,15 +216,7 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 
 		case 'X': // Terminate
 			return
-
 		default:
-			// For startup and other messages, send ReadyForQuery
-			rfqMsg := []byte{
-				'Z', // ReadyForQuery
-				0, 0, 0, 5,
-				'I',
-			}
-			conn.Write(rfqMsg)
 		}
 	}
 }
@@ -210,6 +238,8 @@ func TestMockPgServer_Basic(t *testing.T) {
 		t.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
+
+	performMockStartup(conn)
 
 	// Send SimpleQuery message
 	query := "SELECT 1"
@@ -261,7 +291,7 @@ func TestProxyWithMockServer(t *testing.T) {
 
 	// Start proxy
 	proxyAddr := "127.0.0.1:29090"
-	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -279,6 +309,8 @@ func TestProxyWithMockServer(t *testing.T) {
 		t.Fatalf("Failed to connect to proxy: %v", err)
 	}
 	defer conn.Close()
+
+	performMockStartup(conn)
 
 	// Send SimpleQuery
 	query := "SELECT 42"
@@ -327,7 +359,7 @@ func TestProxyWithFilterAndMock(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29091"
-	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -344,7 +376,10 @@ func TestProxyWithFilterAndMock(t *testing.T) {
 	}
 	defer conn.Close()
 
+	performMockStartup(conn)
+
 	// Send query with "users"
+
 	originalQuery := "SELECT * FROM users"
 	queryMsg := createMockQueryMessage(originalQuery)
 	_, err = conn.Write(queryMsg)
@@ -402,7 +437,7 @@ func TestProxyWithBlockingHandler(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29092"
-	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -418,6 +453,8 @@ func TestProxyWithBlockingHandler(t *testing.T) {
 		t.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
+
+	performMockStartup(conn)
 
 	// Send DELETE query (should be blocked by proxy)
 	deleteQuery := "DELETE FROM users WHERE id = 1"
@@ -466,7 +503,7 @@ func TestProxyWithQueryRewriting(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29093"
-	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -482,6 +519,8 @@ func TestProxyWithQueryRewriting(t *testing.T) {
 		t.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
+
+	performMockStartup(conn)
 
 	originalQuery := "SELECT * FROM users"
 	queryMsg := createMockQueryMessage(originalQuery)
@@ -538,6 +577,8 @@ func TestMockServerWithQueryTracking(t *testing.T) {
 		t.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
+
+	performMockStartup(conn)
 
 	query := "SELECT * FROM test"
 	queryMsg := createMockQueryMessage(query)
@@ -625,6 +666,8 @@ func TestPgMockIntegration(t *testing.T) {
 	}
 	defer conn.Close()
 
+	performMockStartup(conn)
+
 	// Send a SimpleQuery message
 	queryMsg := createMockQueryMessage("SELECT 1")
 	_, err = conn.Write(queryMsg)
@@ -669,7 +712,7 @@ func TestProxyWithPasswordChangeFilter(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29094"
-	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -696,6 +739,8 @@ func TestProxyWithPasswordChangeFilter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to connect: %v", err)
 		}
+
+		performMockStartup(conn)
 
 		queryMsg := createMockQueryMessage(query)
 		_, err = conn.Write(queryMsg)
@@ -744,7 +789,7 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29095"
-	go Start(proxyAddr, "127.0.0.1:"+mock.Port(), handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -760,6 +805,8 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)
 	}
+
+	performMockStartup(conn)
 
 	selectQuery := "SELECT * FROM users"
 	queryMsg := createMockQueryMessage(selectQuery)
@@ -836,4 +883,34 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 			t.Errorf("Query %q should not have reached the mock server. Got: %v", query, queries)
 		}
 	}
+}
+
+// Helper to perform startup sequence with the proxy
+func performMockStartup(conn net.Conn) error {
+	params := map[string]string{
+		"user":     "postgres",
+		"database": "testdb",
+	}
+	var buf bytes.Buffer
+	buf.Write([]byte{0, 0, 0, 0}) // length placeholder
+	buf.Write([]byte{0, 3, 0, 0}) // version 3.0
+	for k, v := range params {
+		buf.WriteString(k)
+		buf.WriteByte(0)
+		buf.WriteString(v)
+		buf.WriteByte(0)
+	}
+	buf.WriteByte(0)
+	out := buf.Bytes()
+	binary.BigEndian.PutUint32(out[:4], uint32(len(out)))
+
+	_, err := conn.Write(out)
+	if err != nil {
+		return err
+	}
+
+	// Read AuthOk and ReadyForQuery
+	resp := make([]byte, 9+6)
+	_, err = io.ReadFull(conn, resp)
+	return err
 }

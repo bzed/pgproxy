@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"net"
 	"testing"
 	"time"
 
@@ -24,7 +23,7 @@ func Benchmark_Start(b *testing.B) {
 		return []byte(query), nil
 	}
 
-	go Start(testBenchmarkHost, testRemoteHost, handler)
+	go Start(testBenchmarkHost, map[string]DBConfig{"testdb": {Addr: testRemoteHost, User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 	time.Sleep(3 * time.Second)
 
 	db, err := sqlx.Open("postgres", "host=127.0.0.1 user=postgres password=testpass dbname=testdb port=9092 sslmode=disable")
@@ -54,7 +53,7 @@ func Test_Start(t *testing.T) {
 		return []byte(query), nil
 	}
 
-	go Start(testProxyHost, testRemoteHost, handler)
+	go Start(testProxyHost, map[string]DBConfig{"testdb": {Addr: testRemoteHost, User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
 	// Increase sleep time to ensure proxy is ready
 	time.Sleep(5 * time.Second)
 
@@ -94,14 +93,6 @@ func Test_Start(t *testing.T) {
 	}
 }
 
-func Test_getResolvedAddresses(t *testing.T) {
-	getResolvedAddresses("127.0.0.1:9090")
-}
-
 func Test_getListener(t *testing.T) {
-	paddr, err := net.ResolveTCPAddr("tcp", testListenerHost)
-	if err != nil {
-		t.Fatal(err)
-	}
-	getListener(paddr)
+	getListener(testListenerHost)
 }
