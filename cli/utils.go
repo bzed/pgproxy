@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/BurntSushi/toml"
+	"github.com/bzed/pgproxy/parser"
 	"github.com/golang/glog"
 )
 
@@ -39,9 +40,12 @@ type ProxyConfig struct {
 		Password string
 		DBName   string
 	} `toml:"DB"`
+	FilterConfig parser.FilterConfig `toml:"Filter"`
 }
 
 func readConfig(file string) (pc ProxyConfig, connStr string) {
+	pc.FilterConfig = parser.DefaultFilterConfig()
+
 	if _, err := os.Stat(file); os.IsNotExist(err) {
 		glog.Errorln("Configuration file not found:", err)
 		os.Exit(int(syscall.ENOENT))

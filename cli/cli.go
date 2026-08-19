@@ -50,10 +50,10 @@ func Main(config interface{}, pargs interface{}) {
 			info(pc.ServerConfig.ProxyAddr)
 			logDir()
 			saveCurrentPid()
-			// Start the proxy with a pass-through handler
-			// Users can provide their own handler via configuration in the future
+			// Start the proxy with the configured filter handler
 			go func() {
-				proxy.Start(pc.ServerConfig.ProxyAddr, pc.DB["master"].Addr, parser.ReturnHandler)
+				queryFilter := parser.NewQueryFilter(pc.FilterConfig)
+				proxy.Start(pc.ServerConfig.ProxyAddr, pc.DB["master"].Addr, queryFilter.Handler)
 			}()
 			glog.Infoln("Started pgproxy successfully.")
 		} else if args[1] == "cli" {

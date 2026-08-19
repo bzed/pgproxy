@@ -7,26 +7,49 @@ package parser
 
 import (
 	"fmt"
-	"strings"
 
 	pgparser "github.com/auxten/postgresql-parser/pkg/sql/parser"
 	"github.com/auxten/postgresql-parser/pkg/sql/sem/tree"
 	"github.com/golang/glog"
 )
 
-// GetQueryModificada callback - Handler function for proxy
-// Receives query string and returns modified query bytes
-func GetQueryModificada(query string) ([]byte, error) {
-	// Example: if query doesn't start with "power", pass through
-	if len(query) < 5 || query[:5] != "power" {
-		return []byte(query), nil
-	}
-	return []byte("select * from clientes limit 1;"), nil
+// FilterConfig holds configurable rules for filtering SQL queries.
+type FilterConfig struct {
+	AllowSelect           bool `toml:"allow_select"`
+	AllowInsert           bool `toml:"allow_insert"`
+	AllowUpdate           bool `toml:"allow_update"`
+	AllowDelete           bool `toml:"allow_delete"`
+	AllowTruncate         bool `toml:"allow_truncate"`
+	RequireWhereForUpdate bool `toml:"require_where_for_update"`
+	RequireWhereForDelete bool `toml:"require_where_for_delete"`
 }
 
-// Filter checks if the SQL statement meets certain criteria.
+// DefaultFilterConfig returns a secure default configuration.
+func DefaultFilterConfig() FilterConfig {
+	return FilterConfig{
+		AllowSelect:           true,
+		AllowInsert:           true,
+		AllowUpdate:           true,
+		AllowDelete:           true,
+		AllowTruncate:         false,
+		RequireWhereForUpdate: true,
+		RequireWhereForDelete: true,
+	}
+}
+
+// QueryFilter applies FilterConfig rules to SQL statements.
+type QueryFilter struct {
+	config FilterConfig
+}
+
+// NewQueryFilter creates a new QueryFilter with the given configuration.
+func NewQueryFilter(config FilterConfig) *QueryFilter {
+	return &QueryFilter{config: config}
+}
+
+// Filter checks if the SQL statement meets the configured criteria.
 // Returns true if the query is safe and should be allowed.
-func Filter(str []byte) bool {
+func (f *QueryFilter) Filter(str []byte) bool {
 	stmts, err := pgparser.Parse(string(str))
 	if err != nil {
 		glog.Errorln(err)
@@ -36,59 +59,40 @@ func Filter(str []byte) bool {
 	for _, stmt := range stmts {
 		switch ast := stmt.AST.(type) {
 		case *tree.Select:
-			if !isSafeSelect(ast) {
+			if !f.config.AllowSelect {
 				return false
 			}
 		case *tree.Delete:
-			if !isSafeDelete(ast) {
+			if !f.config.AllowDelete {
+				return false
+			}
+			if f.config.RequireWhereForDelete && ast.Where == nil {
 				return false
 			}
 		case *tree.Update:
-			if !isSafeUpdate(ast) {
+			if !f.config.AllowUpdate {
+				return false
+			}
+			if f.config.RequireWhereForUpdate && ast.Where == nil {
 				return false
 			}
 		case *tree.Insert:
-			// Inserts are generally safe from unbounded mutation
-			continue
+			if !f.config.AllowInsert {
+				return false
+			}
 		case *tree.Truncate:
-			// Block TRUNCATE (equivalent to unbounded DELETE)
-			return false
+			if !f.config.AllowTruncate {
+				return false
+			}
 		}
 	}
 	return true
 }
 
-// ReturnHandler is a Handler that just logs and passes through the query
-func ReturnHandler(query string) ([]byte, error) {
-	fmt.Println("Query:", query)
+// Handler is a proxy Handler that filters queries based on the configuration.
+func (f *QueryFilter) Handler(query string) ([]byte, error) {
+	if !f.Filter([]byte(query)) {
+		return nil, fmt.Errorf("query blocked by filter")
+	}
 	return []byte(query), nil
-}
-
-// isSafeSelect prevents SELECT * and ORDER BY random() queries.
-func isSafeSelect(ast *tree.Select) bool {
-	if ast.OrderBy != nil {
-		if strings.Contains(strings.ToLower(tree.AsString(&ast.OrderBy)), "rand()") ||
-			strings.Contains(strings.ToLower(tree.AsString(&ast.OrderBy)), "random()") {
-			return false
-		}
-	}
-
-	if sc, ok := ast.Select.(*tree.SelectClause); ok {
-		if tree.AsString(&sc.Exprs) == "*" {
-			return false
-		}
-	}
-	return true
-}
-
-// isSafeDelete ensures we don't execute unbounded deletes.
-func isSafeDelete(ast *tree.Delete) bool {
-	// Must have a WHERE clause to prevent deleting all rows
-	return ast.Where != nil
-}
-
-// isSafeUpdate ensures we don't execute unbounded updates.
-func isSafeUpdate(ast *tree.Update) bool {
-	// Must have a WHERE clause to prevent updating all rows
-	return ast.Where != nil
 }
