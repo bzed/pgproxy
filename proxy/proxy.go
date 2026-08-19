@@ -14,9 +14,9 @@ import (
 	"net"
 	"strings"
 	"sync"
-	
-	"github.com/jackc/pgproto3/v2"
+
 	"github.com/golang/glog"
+	"github.com/jackc/pgproto3/v2"
 )
 
 var (
