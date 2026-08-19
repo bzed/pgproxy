@@ -6,22 +6,25 @@
 
 ## Development Requirements
 
+### Build Environment Constraints
+- **CRITICAL**: The default build cache is read-only. You **MUST** set `export GOCACHE=/tmp/go-cache` for all `go` commands (build, run, test, vet).
+- **CRITICAL**: You **MUST** set `export GOLANGCI_LINT_CACHE=/tmp/golangci-lint-cache` for all `golangci-lint` runs.
+
 ### Code Quality
-- **Always run `go vet ./...`** before committing to catch potential issues
+- **Always run `export GOCACHE=/tmp/go-cache && go vet ./...`** before committing to catch potential issues
 - **Always run `gofmt -l .`** and format any unformatted files with `gofmt -w`
-- **Always run `golangci-lint run ./...`** for additional static analysis before committing
+- **Always run `export GOCACHE=/tmp/go-cache && export GOLANGCI_LINT_CACHE=/tmp/golangci-lint-cache && golangci-lint run --config .golangci.yml ./...`** for additional static analysis before committing
 - **Never commit unformatted code** - the CI pipeline will reject it
 - **Never commit code that fails golangci-lint** - the CI pipeline will reject it
 
 ### Testing
-- Run unit tests: `go test -v ./parser/... ./cli/...`
-- Run mock server tests (no PostgreSQL required): `go test -v -run "TestMock|TestProxy|TestPgMock" ./proxy`
-- Integration tests require PostgreSQL and run only on Linux in CI
+- Run all unit and mock tests: `export GOCACHE=/tmp/go-cache && go test -v ./...`
+- Mock server tests and protocol logic reside in `./proxy/...`
 - New features must include corresponding tests
+- Unix socket testing is automatically skipped on Windows via build flags / runtime checks.
 
 ### Build
 - **Always ensure `go build ./...` succeeds** before committing
-- **Always ensure `go vet ./...` and `gofmt -l .`  succeed** before committing
 - The project builds for Linux, macOS, and Windows
 
 ### Code Style
@@ -29,7 +32,6 @@
 - Use descriptive variable and function names
 - Add comments for exported types and functions
 - Keep lines under 120 characters where practical
-- Use `goimports` for consistent import formatting
 
 ### Git
 - **Never rewrite commits** (no `git commit --amend`, no `git rebase -i`)
@@ -47,13 +49,8 @@
 - Keep dependencies updated
 - Prefer well-maintained, popular libraries
 
-### CI/CD
-- GitHub Actions workflows are in `.github/workflows/`
-- All PRs must pass all CI checks before merging
-- Mock tests run on all platforms
-- Integration tests run on Linux only (require PostgreSQL container)
-
 ### PostgreSQL Integration
+- **PostgreSQL Wire Protocol**: NEVER construct or parse PostgreSQL wire protocol messages manually via byte buffers (`binary.BigEndian`, `bytes.Buffer`). ALL protocol interactions MUST natively use the robust `github.com/jackc/pgproto3/v2` library (`pgproto3.Frontend`, `pgproto3.Backend`, etc.) to prevent packet framing errors.
 - Integration tests connect to localhost:5432
 - Credentials: user=postgres, password=testpass, dbname=testdb
 - Use unique ports for test proxies (9090, 9091, 9092, etc.) to avoid conflicts
