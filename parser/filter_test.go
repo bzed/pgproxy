@@ -43,6 +43,10 @@ func TestFilter(t *testing.T) {
 		t.Errorf("Filter unbounded delete should return false")
 	}
 
+	if Filter([]byte("truncate table a")) {
+		t.Errorf("Filter truncate should return false")
+	}
+
 	if !Filter([]byte("insert into a(id) values(1)")) {
 		t.Errorf("Filter insert failed")
 	}

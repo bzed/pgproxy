@@ -50,6 +50,9 @@ func Filter(str []byte) bool {
 		case *tree.Insert:
 			// Inserts are generally safe from unbounded mutation
 			continue
+		case *tree.Truncate:
+			// Block TRUNCATE (equivalent to unbounded DELETE)
+			return false
 		}
 	}
 	return true
@@ -80,8 +83,8 @@ func isSafeSelect(ast *tree.Select) bool {
 
 // isSafeDelete ensures we don't execute unbounded deletes.
 func isSafeDelete(ast *tree.Delete) bool {
-	// Must have a WHERE clause or a LIMIT to prevent deleting all rows
-	return ast.Where != nil || ast.Limit != nil
+	// Must have a WHERE clause to prevent deleting all rows
+	return ast.Where != nil
 }
 
 // isSafeUpdate ensures we don't execute unbounded updates.
