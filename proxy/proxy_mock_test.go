@@ -615,13 +615,7 @@ func TestMockServerWithQueryTracking(t *testing.T) {
 
 // Helper to create a SimpleQuery message
 func createMockQueryMessage(query string) []byte {
-	queryWithNull := append([]byte(query), 0)
-	msgLength := uint32(len(queryWithNull) + 4)
-	msg := make([]byte, 5+len(queryWithNull))
-	msg[0] = 'Q' // SimpleQuery
-	binary.BigEndian.PutUint32(msg[1:5], msgLength)
-	copy(msg[5:], queryWithNull)
-	return msg
+	return (&pgproto3.Query{String: query}).Encode(nil)
 }
 
 // TestPgMockIntegration tests that pgmock library is integrated and can be used

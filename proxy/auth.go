@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgproto3/v2"
 	"io"
 	"net"
 	"strings"
@@ -92,21 +93,11 @@ func buildStartupMessage(params map[string]string, user, dbname string) []byte {
 	newParams["user"] = user
 	newParams["database"] = dbname
 
-	var buf bytes.Buffer
-	buf.Write([]byte{0, 0, 0, 0}) // placeholder for length
-	buf.Write([]byte{0, 3, 0, 0}) // version 3.0
-
-	for k, v := range newParams {
-		buf.WriteString(k)
-		buf.WriteByte(0)
-		buf.WriteString(v)
-		buf.WriteByte(0)
+	sm := &pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters:      newParams,
 	}
-	buf.WriteByte(0)
-
-	out := buf.Bytes()
-	binary.BigEndian.PutUint32(out[:4], uint32(len(out)))
-	return out
+	return sm.Encode(nil)
 }
 
 // connectBackend connects to the backend database, handles SSL and Authentication,
@@ -127,7 +118,7 @@ func connectBackend(db DBConfig) (net.Conn, error) {
 	}
 
 	// 1. Send SSLRequest
-	sslReq := []byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
+	sslReq := (&pgproto3.SSLRequest{}).Encode(nil)
 	if _, err := conn.Write(sslReq); err != nil {
 		conn.Close()
 		return nil, err

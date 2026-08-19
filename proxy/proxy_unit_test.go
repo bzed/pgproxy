@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"github.com/jackc/pgproto3/v2"
 	"testing"
 )
 
@@ -149,42 +150,18 @@ func TestBufferPool(t *testing.T) {
 func TestMessageParsing(t *testing.T) {
 	// Test creating a simple query message
 	query := "SELECT * FROM users;"
-	msgType := byte('Q')
+	qMsg := &pgproto3.Query{String: query}
+	msg := qMsg.Encode(nil)
 
-	// Create message content with null terminator
-	content := append([]byte(query), 0)
-
-	// Message length = content length + 4 (for the length field itself)
-	msgLength := uint32(len(content) + 4)
-
-	// Create full message
-	msg := make([]byte, 5+len(content))
-	msg[0] = msgType
-	binary.BigEndian.PutUint32(msg[1:5], msgLength)
-	copy(msg[5:], content)
-
-	// Verify we can parse it back
-	parsedMsgType := msg[0]
-	parsedLength := binary.BigEndian.Uint32(msg[1:5])
-	parsedContent := msg[5:]
-
-	if parsedMsgType != msgType {
-		t.Errorf("Message type mismatch: got %c, want %c", parsedMsgType, msgType)
+	// Verify it encodes correctly
+	if msg[0] != 'Q' {
+		t.Errorf("Expected 'Q' prefix")
 	}
-
-	if parsedLength != msgLength {
-		t.Errorf("Message length mismatch: got %d, want %d", parsedLength, msgLength)
-	}
-
-	// Content should end with null terminator
-	if len(parsedContent) == 0 || parsedContent[len(parsedContent)-1] != 0 {
-		t.Errorf("Content should end with null terminator")
-	}
-
-	// Extract query string (without null terminator)
-	queryStr := string(bytes.TrimSuffix(parsedContent, []byte{0}))
-	if queryStr != query {
-		t.Errorf("Query string mismatch: got %q, want %q", queryStr, query)
+	// Extract query string
+	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(bytes.NewReader(msg)), nil)
+	decoded, _ := backend.Receive()
+	if q, ok := decoded.(*pgproto3.Query); !ok || q.String != query {
+		t.Errorf("Query string mismatch")
 	}
 }
 
