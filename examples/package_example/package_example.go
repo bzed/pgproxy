@@ -28,7 +28,7 @@ func main() {
 
 	// Catch ctrl-c to exit gracefully
 	chExit := make(chan os.Signal, 1)
-	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case <-chExit:
 		fmt.Println("Example EXITING...Bye.")

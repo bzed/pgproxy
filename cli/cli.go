@@ -10,7 +10,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/bzed/pgproxy/parser"
@@ -50,12 +52,22 @@ func Main(config interface{}, pargs interface{}) {
 			info(pc.ServerConfig.ProxyAddr)
 			logDir()
 			saveCurrentPid()
+
+			// Set up signal handling for graceful shutdown
+			chExit := make(chan os.Signal, 1)
+			signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM)
+
 			// Start the proxy with the configured filter handler
 			go func() {
 				queryFilter := parser.NewQueryFilter(pc.FilterConfig)
 				proxy.Start(pc.ServerConfig.ProxyAddr, pc.DB, queryFilter.Handler)
 			}()
 			glog.Infoln("Started pgproxy successfully.")
+
+			// Block until termination signal is received
+			<-chExit
+			glog.Infoln("pgproxy shutting down gracefully...")
+			os.Remove("./log/pid.log")
 		} else if args[1] == "cli" {
 			Command()
 		} else if args[1] == "stop" {
@@ -149,16 +161,16 @@ func getCurrentPid() int {
 func stop() {
 	pid := getCurrentPid()
 	if pid != 0 {
-		// Use os.Process.Kill for cross-platform compatibility
+		// Use os.Process.Signal for graceful cross-platform compatibility
 		process, err := os.FindProcess(pid)
 		if err != nil {
 			glog.Errorln(err)
 		} else {
-			err = process.Kill()
+			err = process.Signal(syscall.SIGTERM)
 			if err != nil {
-				glog.Errorln(err)
+				glog.Errorln("Failed to send SIGTERM:", err)
 			} else {
-				glog.Infoln("pgproxy exit successfully!")
+				glog.Infoln("pgproxy stop signal sent successfully!")
 			}
 		}
 	}

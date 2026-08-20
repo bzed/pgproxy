@@ -5,44 +5,25 @@
 // Program pgproxy is a proxy-server to database PostgreSQL.
 package main
 
-// import (
-// 	"github.com/bzed/pgproxy/cli"
-// )
-
-// func main() {
-// 	cli.Main(nil, nil)
-// }
-
 import (
 	"encoding/json"
 	"fmt"
 	"strings"
 
 	pgparser "github.com/auxten/postgresql-parser/pkg/sql/parser"
-	"github.com/bzed/pgproxy/proxy"
+	"github.com/bzed/pgproxy/cli"
 )
 
 func main() {
-	// Create a new pgproxy instance
-	dbs := map[string]proxy.DBConfig{
-		"testdb": {
-			Addr:     "localhost:5432",
-			User:     "postgres",
-			Password: "testpass",
-			DBName:   "testdb",
-		},
-	}
-	proxy.Start(
-		"localhost:5433",
-		dbs,
-		loggingHandler,
-	)
+	_ = loggingHandler
+	cli.Main(nil, nil)
 }
 
 type Metadata struct {
 	TransactionID string `json:"transaction_id"`
 }
 
+//nolint:unparam
 func loggingHandler(query string) ([]byte, error) {
 	fmt.Println("Handler invoked with query:", query)
 
