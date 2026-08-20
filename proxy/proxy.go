@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/coreos/go-systemd/v22/activation"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/golang/glog"
 	"github.com/jackc/pgproto3/v2"
 )
@@ -33,6 +35,13 @@ func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) {
 	glog.Infof("Proxying from %v with %d configured databases\n", proxyHost, len(dbs))
 
 	listener := getListener(proxyHost)
+
+	// Notify systemd that the service is ready
+	if ok, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
+		glog.Errorf("Failed to notify systemd: %v", err)
+	} else if ok {
+		glog.Infof("Systemd notified successfully")
+	}
 
 	for {
 		conn, err := listener.Accept()
@@ -56,8 +65,14 @@ func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) {
 
 // Listener of a net.Addr.
 func getListener(host string) net.Listener {
+	// First, check for systemd socket activation
+	listeners, err := activation.Listeners()
+	if err == nil && len(listeners) > 0 {
+		glog.Infof("Using systemd socket activation")
+		return listeners[0]
+	}
+
 	var listener net.Listener
-	var err error
 	if strings.HasPrefix(host, "/") || strings.HasPrefix(host, "unix:") {
 		host = strings.TrimPrefix(host, "unix:")
 		listener, err = net.Listen("unix", host)

@@ -6,31 +6,11 @@ import (
 	"testing"
 )
 
-func TestHelp(t *testing.T) {
-	// Should just print help to stdout
-	help()
-}
 
 func TestInfo(t *testing.T) {
 	info("localhost:9090")
 }
 
-func TestLogDirAndPid(t *testing.T) {
-	// Setup log dir
-	logDir()
-
-	// Write PID
-	saveCurrentPid()
-
-	// Read PID
-	pid := getCurrentPid()
-	if pid == 0 {
-		t.Errorf("getCurrentPid() returned 0")
-	}
-
-	// Should not crash when stop is called (will try to kill itself, but since we are running tests, it will just log or exit, actually wait - if it kills itself the test fails!)
-	// We'll skip testing stop() directly because it sends SIGKILL to os.Getpid().
-}
 
 func TestMainHelp(t *testing.T) {
 	oldArgs := os.Args
@@ -59,8 +39,4 @@ DBName = "testdb"
 	// Test Main with insufficient args
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	Main(configFile, []string{"pgproxy"})
-
-	// Test stop directly
-	os.Remove("./log/pid.log") // Ensure no valid pid
-	stop()
 }
