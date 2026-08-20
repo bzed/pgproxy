@@ -1,0 +1,22 @@
+[Unit]
+Description=pgproxy - PostgreSQL proxy server
+Requires=pgproxy.socket
+After=network.target pgproxy.socket
+
+[Service]
+Type=notify
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/pgproxy -config /etc/pgproxy/pgproxy.conf
+# Secure defaults
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target
