@@ -72,6 +72,8 @@ func TestQueryFilterConfig(t *testing.T) {
 
 func TestQueryFilterSignatures(t *testing.T) {
 	config := DefaultFilterConfig()
+	config.SignatureFilterEnabled = true
+	config.SignatureAllowByDefault = true
 	config.BlockSignatures = []string{
 		"SELECT * FROM users WHERE (id = _) AND (name = _)",
 	}
@@ -93,6 +95,7 @@ func TestQueryFilterSignatures(t *testing.T) {
 
 	// Test AllowSignatures strictly
 	config2 := DefaultFilterConfig()
+	config2.SignatureFilterEnabled = true
 	config2.AllowSignatures = []string{
 		"SELECT id FROM allowed_table",
 	}

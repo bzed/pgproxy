@@ -24,6 +24,10 @@ type FilterConfig struct {
 	RequireWhereForUpdate bool `toml:"require_where_for_update"`
 	RequireWhereForDelete bool `toml:"require_where_for_delete"`
 
+	SignatureFilterEnabled  bool `toml:"signature_filter_enabled"`
+	SignatureAllowByDefault bool `toml:"signature_allow_by_default"`
+	SignatureAuditMode      bool `toml:"signature_audit_mode"`
+
 	BlockSignatures []string `toml:"block_signatures"`
 	AllowSignatures []string `toml:"allow_signatures"`
 }
@@ -65,22 +69,41 @@ func (f *QueryFilter) Filter(str []byte) bool {
 		// Signature-based filtering
 		sig := tree.AsStringWithFlags(stmt.AST, tree.FmtHideConstants)
 
-		for _, b := range f.config.BlockSignatures {
-			if sig == b {
-				return false
-			}
-		}
+		if f.config.SignatureFilterEnabled {
+			blocked := false
 
-		if len(f.config.AllowSignatures) > 0 {
-			allowed := false
-			for _, a := range f.config.AllowSignatures {
-				if sig == a {
-					allowed = true
+			// Check block signatures first
+			for _, b := range f.config.BlockSignatures {
+				if sig == b {
+					blocked = true
 					break
 				}
 			}
-			if !allowed {
-				return false
+
+			// If not blocked by blocklist, check allow logic
+			if !blocked {
+				allowed := false
+				for _, a := range f.config.AllowSignatures {
+					if sig == a {
+						allowed = true
+						break
+					}
+				}
+
+				if !allowed {
+					// If it wasn't explicitly allowed, fallback to default behavior
+					if !f.config.SignatureAllowByDefault {
+						blocked = true
+					}
+				}
+			}
+
+			if blocked {
+				if f.config.SignatureAuditMode {
+					glog.Infof("SIGNATURE_AUDIT: %q", sig)
+				} else {
+					return false
+				}
 			}
 		}
 
