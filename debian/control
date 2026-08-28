@@ -1,0 +1,15 @@
+Source: pgproxy
+Section: database
+Priority: optional
+Maintainer: bzed <bzed@localhost>
+Build-Depends: debhelper-compat (= 13), golang-any
+Standards-Version: 4.6.0
+Homepage: https://github.com/bzed/pgproxy
+
+Package: pgproxy
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: PostgreSQL proxy server
+ pgproxy is a PostgreSQL proxy server that supports query filtering,
+ signature-based blocking, read/write splitting, and transparent
+ query rewriting.

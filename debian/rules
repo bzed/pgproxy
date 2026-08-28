@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+export GOCACHE=/tmp/go-cache
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	go build -v -o pgproxy
+
+override_dh_auto_test:
+	go test -v ./...
+
+override_dh_auto_install:
+	# Handled by install files
+
+override_dh_dwz:
+	# Disabled for Go binaries
+
+override_dh_strip:
+	# Disabled for Go binaries

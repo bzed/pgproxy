@@ -1,0 +1,2 @@
+pgproxy usr/bin
+pgproxy.conf etc/pgproxy
