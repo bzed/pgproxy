@@ -29,10 +29,12 @@ jobs:
           sudo apt-get install -y debhelper devscripts dpkg-dev
 
       - name: Build Debian package
-        run: dpkg-buildpackage -us -uc -b -d
+        run: |
+          dpkg-buildpackage -us -uc -b -d
+          mv ../*.deb .
 
       - name: Upload Debian package artifact
         uses: actions/upload-artifact@v4
         with:
           name: pgproxy-deb
-          path: ../*.deb
+          path: ./*.deb
