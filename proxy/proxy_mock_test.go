@@ -293,7 +293,7 @@ func TestProxyWithMockServer(t *testing.T) {
 
 	// Start proxy
 	proxyAddr := "127.0.0.1:29090"
-	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -361,7 +361,7 @@ func TestProxyWithFilterAndMock(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29091"
-	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -439,7 +439,7 @@ func TestProxyWithBlockingHandler(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29092"
-	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -505,7 +505,7 @@ func TestProxyWithQueryRewriting(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29093"
-	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -708,7 +708,7 @@ func TestProxyWithPasswordChangeFilter(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29094"
-	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -785,7 +785,7 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 	}
 
 	proxyAddr := "127.0.0.1:29095"
-	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), User: "postgres", Password: "testpass", DBName: "testdb"}}, handler)
+	go Start(proxyAddr, map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}, handler)
 
 	time.Sleep(200 * time.Millisecond)
 	defer func() {
@@ -945,9 +945,7 @@ func TestProxyWithUnixSocket(t *testing.T) {
 	dbs := map[string]DBConfig{
 		"testdb": {
 			Addr:     backendSocket,
-			User:     "postgres",
-			Password: "testpass",
-			DBName:   "testdb",
+									DBName:   "testdb",
 		},
 	}
 

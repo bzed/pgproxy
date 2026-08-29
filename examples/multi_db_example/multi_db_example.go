@@ -13,15 +13,11 @@ func main() {
 	dbs := map[string]proxy.DBConfig{
 		"primary": {
 			Addr:     "localhost:5432",
-			User:     "postgres",
-			Password: "mysecretpassword",
-			DBName:   "primary_db",
+									DBName:   "primary_db",
 		},
 		"analytics": {
 			Addr:     "10.0.0.5:5432",
-			User:     "analytics_user",
-			Password: "analyticspassword",
-			DBName:   "analytics_db",
+									DBName:   "analytics_db",
 		},
 	}
 

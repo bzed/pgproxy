@@ -2,27 +2,20 @@ package proxy
 
 import (
 	"bytes"
-	"crypto/md5"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/hex"
-	"errors"
 	"fmt"
-	"github.com/jackc/pgproto3/v2"
 	"io"
 	"net"
 	"strings"
 
-	"github.com/lib/pq/scram"
+	"github.com/jackc/pgproto3/v2"
 )
 
 // DBConfig holds the configuration for a target database
 type DBConfig struct {
-	Addr     string
-	User     string
-	Password string
-	DBName   string
+	Addr   string
+	DBName string
 }
 
 // readStartupMessage reads the initial packets from the client.
@@ -84,25 +77,10 @@ func parseStartupParams(data []byte) map[string]string {
 }
 
 // buildStartupMessage constructs a StartupMessage with overridden user and database.
-func buildStartupMessage(params map[string]string, user, dbname string) []byte {
-	// copy params
-	newParams := make(map[string]string)
-	for k, v := range params {
-		newParams[k] = v
-	}
-	newParams["user"] = user
-	newParams["database"] = dbname
-
-	sm := &pgproto3.StartupMessage{
-		ProtocolVersion: pgproto3.ProtocolVersionNumber,
-		Parameters:      newParams,
-	}
-	return sm.Encode(nil)
-}
 
 // connectBackend connects to the backend database, handles SSL and Authentication,
 // and leaves the connection in a state ready to be piped to the client.
-func connectBackend(db DBConfig) (net.Conn, error) {
+func connectBackend(db DBConfig, startupMsg []byte) (net.Conn, error) {
 	network := "tcp"
 	addr := db.Addr
 	if strings.HasPrefix(addr, "/") {
@@ -132,154 +110,14 @@ func connectBackend(db DBConfig) (net.Conn, error) {
 		conn = tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
 	}
 
-	// 2. Send StartupMessage
-	params := map[string]string{
-		"user":             db.User,
-		"database":         db.DBName,
-		"application_name": "pgproxy",
-	}
-	startupMsg := buildStartupMessage(params, db.User, db.DBName)
+	// 2. Pass through the client's original StartupMessage
 	if _, err := conn.Write(startupMsg); err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	// 3. Handle Authentication
-	var saslClient *scram.Client
-	for {
-		var header [5]byte
-		if _, err := io.ReadFull(conn, header[:]); err != nil {
-			conn.Close()
-			return nil, err
-		}
-		msgType := header[0]
-		msgLen := binary.BigEndian.Uint32(header[1:5]) - 4
-
-		payload := make([]byte, msgLen)
-		if msgLen > 0 {
-			if _, err := io.ReadFull(conn, payload); err != nil {
-				conn.Close()
-				return nil, err
-			}
-		}
-
-		if msgType == 'E' {
-			conn.Close()
-			return nil, errors.New("backend error: " + string(payload))
-		}
-
-		if msgType == 'R' {
-			authType := binary.BigEndian.Uint32(payload[:4])
-			if authType == 0 {
-				// AuthOk!
-				// We do NOT consume the AuthOk message entirely, we want to forward it to the client!
-				// Wait, the client is waiting for AuthOk. We can return an AuthOk buffer to send to client.
-				// But we've already consumed it from the socket.
-				return &peekedConn{Conn: conn, peeked: append(header[:], payload...)}, nil
-			} else if authType == 3 { // Cleartext
-				conn.Close()
-				return nil, errors.New("cleartext authentication is not supported")
-			} else if authType == 10 { // SASL
-				// Assume SCRAM-SHA-256 is supported by the server and pick it.
-				// The payload contains a list of supported mechanisms, but we hardcode SCRAM-SHA-256.
-				saslClient = scram.NewClient(sha256.New, db.User, db.Password)
-				saslClient.Step(nil)
-				clientOut := saslClient.Out()
-
-				mech := "SCRAM-SHA-256"
-				msgLen := 4 + len(mech) + 1 + 4 + len(clientOut)
-				resp := make([]byte, 1+msgLen)
-				resp[0] = 'p'
-				binary.BigEndian.PutUint32(resp[1:5], uint32(msgLen))
-				copy(resp[5:], mech)
-				resp[5+len(mech)] = 0
-				binary.BigEndian.PutUint32(resp[5+len(mech)+1:5+len(mech)+5], uint32(len(clientOut)))
-				copy(resp[5+len(mech)+5:], clientOut)
-
-				if _, err := conn.Write(resp); err != nil {
-					conn.Close()
-					return nil, err
-				}
-			} else if authType == 11 { // SASLContinue
-				if saslClient == nil {
-					conn.Close()
-					return nil, errors.New("unexpected SASLContinue")
-				}
-				serverFirstMessage := payload[4:]
-				saslClient.Step(serverFirstMessage)
-				if err := saslClient.Err(); err != nil {
-					conn.Close()
-					return nil, err
-				}
-				clientOut := saslClient.Out()
-				msgLen := 4 + len(clientOut)
-				resp := make([]byte, 1+msgLen)
-				resp[0] = 'p'
-				binary.BigEndian.PutUint32(resp[1:5], uint32(msgLen))
-				copy(resp[5:], clientOut)
-
-				if _, err := conn.Write(resp); err != nil {
-					conn.Close()
-					return nil, err
-				}
-			} else if authType == 12 { // SASLFinal
-				if saslClient == nil {
-					conn.Close()
-					return nil, errors.New("unexpected SASLFinal")
-				}
-				serverFinalMessage := payload[4:]
-				saslClient.Step(serverFinalMessage)
-				if err := saslClient.Err(); err != nil {
-					conn.Close()
-					return nil, err
-				}
-			} else if authType == 5 { // MD5
-				salt := payload[4:8]
-				hash := computeMD5(db.Password, db.User, salt)
-				pwdMsg := make([]byte, 5+len(hash)+1)
-				pwdMsg[0] = 'p'
-				binary.BigEndian.PutUint32(pwdMsg[1:5], uint32(len(hash)+5))
-				copy(pwdMsg[5:], hash)
-				pwdMsg[len(pwdMsg)-1] = 0
-				if _, err := conn.Write(pwdMsg); err != nil {
-					conn.Close()
-					return nil, err
-				}
-			} else {
-				conn.Close()
-				return nil, fmt.Errorf("unsupported auth type: %d", authType)
-			}
-		} else {
-			conn.Close()
-			return nil, fmt.Errorf("unexpected message type during auth: %c", msgType)
-		}
-	}
-}
-
-func computeMD5(password, user string, salt []byte) string {
-	h := md5.New()
-	h.Write([]byte(password + user))
-	hash1 := hex.EncodeToString(h.Sum(nil))
-
-	h2 := md5.New()
-	h2.Write([]byte(hash1))
-	h2.Write(salt)
-	hash2 := hex.EncodeToString(h2.Sum(nil))
-
-	return "md5" + hash2
+	// We are done! Return the connection to the proxy handler so it can seamlessly proxy the Auth requests/responses.
+	return conn, nil
 }
 
 // peekedConn wraps a net.Conn and replays peeked bytes first
-type peekedConn struct {
-	net.Conn
-	peeked []byte
-}
-
-func (c *peekedConn) Read(b []byte) (n int, err error) {
-	if len(c.peeked) > 0 {
-		n = copy(b, c.peeked)
-		c.peeked = c.peeked[n:]
-		return n, nil
-	}
-	return c.Conn.Read(b)
-}

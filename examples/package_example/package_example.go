@@ -13,9 +13,7 @@ func main() {
 	dbs := map[string]proxy.DBConfig{
 		"testdb": {
 			Addr:     "localhost:5432",
-			User:     "postgres",
-			Password: "mysecretpassword",
-			DBName:   "postgres",
+									DBName:   "postgres",
 		},
 	}
 	proxy.Start(

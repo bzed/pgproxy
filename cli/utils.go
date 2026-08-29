@@ -63,6 +63,6 @@ func readConfig(file string) (pc ProxyConfig, connStr string) {
 		glog.Fatalln("Invalid database address format in configuration. Expected 'host:port'")
 	}
 
-	return pc, fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s application_name=pgproxy sslmode=disable",
-		master.Addr[0:sepindex], master.Addr[(sepindex+1):], master.User, master.Password, master.DBName)
+	return pc, fmt.Sprintf("host=%s port=%s dbname=%s application_name=pgproxy sslmode=disable",
+		master.Addr[0:sepindex], master.Addr[(sepindex+1):], master.DBName)
 }

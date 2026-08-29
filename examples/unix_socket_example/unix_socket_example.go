@@ -13,9 +13,7 @@ func main() {
 	dbs := map[string]proxy.DBConfig{
 		"postgres": {
 			Addr:     "/var/run/postgresql/.s.PGSQL.5432", // Backend Unix Socket
-			User:     "postgres",
-			Password: "mysecretpassword",
-			DBName:   "postgres",
+									DBName:   "postgres",
 		},
 	}
 

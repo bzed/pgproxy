@@ -145,7 +145,7 @@ func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
 	defer p.lconn.Close()
 
 	// 1. Read StartupMessage from client
-	params, _, err := readStartupMessage(p.lconn)
+	params, startupMsgBytes, err := readStartupMessage(p.lconn)
 	if err != nil {
 		p.err("Failed to read startup message: %s", err)
 		return
@@ -165,7 +165,7 @@ func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
 	}
 
 	// 2. Connect to backend and handle auth
-	rconn, err := connectBackend(dbConf)
+	rconn, err := connectBackend(dbConf, startupMsgBytes)
 	if err != nil {
 		errResp := buildErrorResponse("FATAL", "backend connection failed: "+err.Error())
 		_, _ = p.lconn.Write(errResp)
