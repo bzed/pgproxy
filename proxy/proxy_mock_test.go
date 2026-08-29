@@ -944,8 +944,8 @@ func TestProxyWithUnixSocket(t *testing.T) {
 
 	dbs := map[string]DBConfig{
 		"testdb": {
-			Addr:     backendSocket,
-									DBName:   "testdb",
+			Addr:   backendSocket,
+			DBName: "testdb",
 		},
 	}
 

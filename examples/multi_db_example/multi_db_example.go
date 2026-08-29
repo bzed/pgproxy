@@ -12,12 +12,12 @@ import (
 func main() {
 	dbs := map[string]proxy.DBConfig{
 		"primary": {
-			Addr:     "localhost:5432",
-									DBName:   "primary_db",
+			Addr:   "localhost:5432",
+			DBName: "primary_db",
 		},
 		"analytics": {
-			Addr:     "10.0.0.5:5432",
-									DBName:   "analytics_db",
+			Addr:   "10.0.0.5:5432",
+			DBName: "analytics_db",
 		},
 	}
 
