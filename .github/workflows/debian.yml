@@ -14,23 +14,24 @@ jobs:
   build-deb:
     name: Build Debian Package
     runs-on: ubuntu-latest
+    container: debian:stable-slim
     steps:
+      # Pre-install git so actions/checkout works inside the slim container
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y git ca-certificates
+
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.x'
-
       - name: Install packaging dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y debhelper devscripts dpkg-dev
+          apt-get install -y debhelper devscripts dpkg-dev golang-any
 
       - name: Build Debian package
         run: |
-          dpkg-buildpackage -us -uc -b -d
+          dpkg-buildpackage -us -uc -b
           mv ../*.deb .
 
       - name: Upload Debian package artifact
