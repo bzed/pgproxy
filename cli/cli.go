@@ -24,7 +24,10 @@ import (
 // Main starts pgproxy using the TOML configuration at configPath. An empty
 // configPath falls back to the -config flag (default "pgproxy.conf"). Main
 // blocks until it receives SIGINT/SIGTERM, then shuts the proxy down
-// gracefully.
+// gracefully. It is a thin wrapper around run() that wires up the real
+// process-wide flag set and OS signal channel; run() carries the actual
+// startup/shutdown logic and is what tests exercise directly, since calling
+// Main more than once per test binary would panic on flag redefinition.
 func Main(configPath string) {
 	proxyconf := flag.String("config", "pgproxy.conf", "configuration file for pgproxy")
 	flag.Parse()
@@ -34,6 +37,16 @@ func Main(configPath string) {
 		configPath = *proxyconf
 	}
 
+	chExit := make(chan os.Signal, 1)
+	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM)
+	run(configPath, chExit)
+}
+
+// run reads the configuration, starts the proxy, and blocks until chExit
+// receives a value, then shuts the proxy down gracefully. Split out of Main
+// so it can be driven with a synthetic channel in tests, without touching
+// process-wide flag registration or real OS signals.
+func run(configPath string, chExit <-chan os.Signal) {
 	pc, err := readConfig(configPath)
 	if err != nil {
 		glog.Fatalln(err)
@@ -49,8 +62,6 @@ func Main(configPath string) {
 	}
 
 	// Block until termination signal is received, then shut down gracefully.
-	chExit := make(chan os.Signal, 1)
-	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM)
 	<-chExit
 
 	glog.Infoln("pgproxy shutting down gracefully...")

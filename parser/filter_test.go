@@ -4,6 +4,15 @@ import (
 	"testing"
 )
 
+// mustFilter is a helper: filter.Filter(query) must equal want, else the
+// test fails with the query included in the message.
+func mustFilter(t *testing.T, filter *QueryFilter, query string, want bool) {
+	t.Helper()
+	if got := filter.Filter([]byte(query)); got != want {
+		t.Errorf("Filter(%q) = %v, want %v", query, got, want)
+	}
+}
+
 func TestQueryFilter(t *testing.T) {
 	config := DefaultFilterConfig()
 	filter := NewQueryFilter(config)
@@ -106,5 +115,217 @@ func TestQueryFilterSignatures(t *testing.T) {
 	}
 	if filter2.Filter([]byte("SELECT id, name FROM allowed_table")) {
 		t.Errorf("Filter should block query NOT in AllowSignatures when AllowSignatures is populated")
+	}
+}
+
+// TestFilter_OnParseErrorPolicy covers the three OnParseError policies:
+// "" (default, treated as "block"), "allow", and "audit".
+func TestFilter_OnParseErrorPolicy(t *testing.T) {
+	const garbage = "select * from" // unparseable
+
+	tests := []struct {
+		name         string
+		onParseError string
+		want         bool
+	}{
+		{"default (empty) blocks", "", false},
+		{"explicit block", "block", false},
+		{"allow lets it through", "allow", true},
+		{"audit lets it through and logs", "audit", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := DefaultFilterConfig()
+			config.OnParseError = tt.onParseError
+			filter := NewQueryFilter(config)
+			mustFilter(t, filter, garbage, tt.want)
+		})
+	}
+}
+
+// TestFilter_SignatureAuditMode checks that a signature match in audit mode
+// logs instead of blocking, and the statement then falls through to the
+// normal per-statement-type rules.
+func TestFilter_SignatureAuditMode(t *testing.T) {
+	config := DefaultFilterConfig()
+	config.SignatureFilterEnabled = true
+	config.SignatureAuditMode = true
+	config.BlockSignatures = []string{"SELECT * FROM users WHERE (id = _)"}
+
+	filter := NewQueryFilter(config)
+
+	// Matches a "blocked" signature, but audit mode does not enforce it -
+	// the query is still allowed by the (default) per-statement-type rules.
+	mustFilter(t, filter, "SELECT * FROM users WHERE id = 123", true)
+}
+
+// TestFilter_BypassPrevention exercises extractStatements: mutations hidden
+// inside EXPLAIN, PREPARE, or a CTE must still be evaluated against the
+// per-statement-type rules, not silently passed through.
+func TestFilter_BypassPrevention(t *testing.T) {
+	tests := []struct {
+		name   string
+		query  string
+		config func() FilterConfig
+		want   bool
+	}{
+		{
+			name:  "EXPLAIN hides an unbounded delete",
+			query: "EXPLAIN DELETE FROM a",
+			config: func() FilterConfig {
+				return DefaultFilterConfig() // RequireWhereForDelete defaults true
+			},
+			want: false,
+		},
+		{
+			name:  "EXPLAIN of a properly bounded delete is allowed",
+			query: "EXPLAIN DELETE FROM a WHERE id = 1",
+			config: func() FilterConfig {
+				return DefaultFilterConfig()
+			},
+			want: true,
+		},
+		{
+			name:  "PREPARE hides a disallowed truncate",
+			query: "PREPARE stmt1 AS TRUNCATE TABLE a",
+			config: func() FilterConfig {
+				return DefaultFilterConfig() // AllowTruncate defaults false
+			},
+			want: false,
+		},
+		{
+			name:  "PREPARE of an allowed statement passes through",
+			query: "PREPARE stmt1 AS DELETE FROM a WHERE id = 1",
+			config: func() FilterConfig {
+				return DefaultFilterConfig()
+			},
+			want: true,
+		},
+		{
+			name:  "CTE hides an unbounded delete inside a SELECT",
+			query: "WITH cte AS (DELETE FROM a) SELECT * FROM cte",
+			config: func() FilterConfig {
+				return DefaultFilterConfig()
+			},
+			want: false,
+		},
+		{
+			name:  "extractStatements recurses into an INSERT's CTE",
+			query: "WITH cte AS (SELECT 1) INSERT INTO a SELECT * FROM cte",
+			config: func() FilterConfig {
+				c := DefaultFilterConfig()
+				c.AllowInsert = false
+				return c
+			},
+			want: false, // the top-level Insert itself is disallowed
+		},
+		{
+			name:  "extractStatements recurses into an UPDATE's CTE without breaking a legitimate query",
+			query: "WITH cte AS (SELECT 1) UPDATE a SET b = 1 WHERE id IN (SELECT * FROM cte)",
+			config: func() FilterConfig {
+				return DefaultFilterConfig() // has its own WHERE, should be allowed
+			},
+			want: true,
+		},
+		{
+			name:  "CTE hides an unbounded delete inside a DELETE",
+			query: "WITH cte AS (DELETE FROM a) DELETE FROM b WHERE id IN (SELECT * FROM cte)",
+			config: func() FilterConfig {
+				return DefaultFilterConfig() // outer delete has WHERE, inner cte delete does not
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter := NewQueryFilter(tt.config())
+			mustFilter(t, filter, tt.query, tt.want)
+		})
+	}
+}
+
+// TestFilter_ExecuteAndSetVar covers the AllowExecute/AllowSetVar switches.
+func TestFilter_ExecuteAndSetVar(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		allow   bool
+		enabled func(c *FilterConfig, v bool)
+		want    bool
+	}{
+		{"execute blocked by default", "EXECUTE stmt1", false, func(c *FilterConfig, v bool) { c.AllowExecute = v }, false},
+		{"execute allowed when enabled", "EXECUTE stmt1", true, func(c *FilterConfig, v bool) { c.AllowExecute = v }, true},
+		{"set blocked by default", "SET search_path = public", false, func(c *FilterConfig, v bool) { c.AllowSetVar = v }, false},
+		{"set allowed when enabled", "SET search_path = public", true, func(c *FilterConfig, v bool) { c.AllowSetVar = v }, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := DefaultFilterConfig()
+			tt.enabled(&config, tt.allow)
+			filter := NewQueryFilter(config)
+			mustFilter(t, filter, tt.query, tt.want)
+		})
+	}
+}
+
+// TestFilter_UnknownStatementTypeAllowedByDefault checks that a statement
+// type the switch doesn't explicitly handle (e.g. CREATE TABLE) is allowed
+// by default, per the documented "unmatched statements pass through" scope.
+func TestFilter_UnknownStatementTypeAllowedByDefault(t *testing.T) {
+	filter := NewQueryFilter(DefaultFilterConfig())
+	mustFilter(t, filter, "CREATE TABLE foo (id int)", true)
+}
+
+// TestQueryFilter_Handler covers QueryFilter.Handler's pass-through and
+// blocked paths.
+func TestQueryFilter_Handler(t *testing.T) {
+	filter := NewQueryFilter(DefaultFilterConfig())
+
+	out, err := filter.Handler("select a from b")
+	if err != nil {
+		t.Fatalf("Handler() unexpected error: %v", err)
+	}
+	if string(out) != "select a from b" {
+		t.Errorf("Handler() = %q, want unchanged query", out)
+	}
+
+	if _, err := filter.Handler("delete from a"); err == nil {
+		t.Error("Handler() expected an error for a blocked query, got nil")
+	}
+}
+
+// TestWarnIfFilterConfigIsUnsafe covers both the "blocks everything" warning
+// case and every safe configuration that must not warn.
+func TestWarnIfFilterConfigIsUnsafe(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   FilterConfig
+		wantWarn bool
+	}{
+		{"signature filter disabled", FilterConfig{SignatureFilterEnabled: false}, false},
+		{
+			"allow by default",
+			FilterConfig{SignatureFilterEnabled: true, SignatureAllowByDefault: true},
+			false,
+		},
+		{
+			"has an allow list",
+			FilterConfig{SignatureFilterEnabled: true, SignatureAllowByDefault: false, AllowSignatures: []string{"x"}},
+			false,
+		},
+		{
+			"blocks everything: enabled, deny by default, empty allow list",
+			FilterConfig{SignatureFilterEnabled: true, SignatureAllowByDefault: false},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			warned := false
+			WarnIfFilterConfigIsUnsafe(tt.config, func(format string, args ...interface{}) { warned = true })
+			if warned != tt.wantWarn {
+				t.Errorf("WarnIfFilterConfigIsUnsafe warned = %v, want %v", warned, tt.wantWarn)
+			}
+		})
 	}
 }

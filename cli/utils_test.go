@@ -49,6 +49,19 @@ func Test_readConfig_missingFile(t *testing.T) {
 	}
 }
 
+func Test_readConfig_malformedTOML(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "bad.conf")
+	// Unterminated table header - not valid TOML.
+	if err := os.WriteFile(configPath, []byte("[ServerConfig\n"), 0644); err != nil {
+		t.Fatalf("Failed to create test config: %v", err)
+	}
+
+	if _, err := readConfig(configPath); err == nil {
+		t.Error("Expected an error for malformed TOML, got nil")
+	}
+}
+
 func Test_readConfig_missingMaster(t *testing.T) {
 	testConfig := `
 [ServerConfig]
