@@ -8,7 +8,7 @@ require (
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/golang/glog v1.2.4
 	github.com/jackc/pgmock v0.0.0-20210724152146-4ad1a8207f65
-	github.com/jackc/pgproto3/v2 v2.1.1
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jmoiron/sqlx v1.3.5
 	github.com/lib/pq v1.10.9
 )
@@ -27,16 +27,17 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway v1.16.0 // indirect
 	github.com/jackc/chunkreader/v2 v2.0.1 // indirect
 	github.com/jackc/pgio v1.0.0 // indirect
+	github.com/jackc/pgproto3/v2 v2.1.1 // indirect
 	github.com/konsorten/go-windows-terminal-sequences v1.0.3 // indirect
-	github.com/kr/pretty v0.2.0 // indirect
+	github.com/kr/pretty v0.3.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/rogpeppe/go-internal v1.6.1 // indirect
 	github.com/sirupsen/logrus v1.6.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/stretchr/testify v1.10.0 // indirect
-	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9 // indirect
+	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.1.0 // indirect
-	golang.org/x/text v0.3.6 // indirect
+	golang.org/x/text v0.29.0 // indirect
 	google.golang.org/genproto v0.0.0-20200911024640-645f7a48b24f // indirect
 	google.golang.org/grpc v1.33.1 // indirect
 	google.golang.org/protobuf v1.25.0 // indirect

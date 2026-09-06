@@ -17,7 +17,7 @@ import (
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/golang/glog"
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 var (
@@ -34,10 +34,15 @@ type Handler func(query string) ([]byte, error)
 // connection, be forwarded to the right backend.
 type backendSession struct {
 	target    backendTarget
-	secretKey uint32
+	secretKey [4]byte
 }
 
-var cancelRegistry sync.Map // map[uint32(processID)]backendSession
+type cancelKey struct {
+	pid    uint32
+	secret [4]byte
+}
+
+var cancelRegistry sync.Map // map[cancelKey]backendSession
 
 // Start proxy server needed receive proxyHost, and database configs.
 // It binds the listener synchronously and returns immediately; connections
@@ -126,6 +131,7 @@ func getListener(host string) (net.Listener, error) {
 // Proxy - Manages a Proxy connection, piping data between proxy and remote.
 type Proxy struct {
 	lconn, rconn net.Conn
+	lconnMutex   sync.Mutex
 	errOnce      sync.Once
 	errsig       chan struct{}
 	prefix       string
@@ -164,16 +170,22 @@ func (p *Proxy) err(msg string, err error) {
 // writeError sends a pgproto3 ErrorResponse to the client. Best-effort: the
 // connection may already be broken, in which case the write error is
 // ignored since the caller is about to tear the session down anyway.
-func (p *Proxy) writeError(severity, message string) {
-	_, _ = p.lconn.Write(buildErrorResponse(severity, message))
+func (p *Proxy) writeError(severity, message string, code string) {
+	p.lconnMutex.Lock()
+	defer p.lconnMutex.Unlock()
+	_, _ = p.lconn.Write(buildErrorResponse(severity, message, code))
 }
 
-func buildErrorResponse(severity, message string) []byte {
+func buildErrorResponse(severity, message string, code string) []byte {
+	if code == "" {
+		code = "XX000"
+	}
 	errResp := &pgproto3.ErrorResponse{
 		Severity: severity,
 		Message:  message,
+		Code:     code,
 	}
-	return errResp.Encode(nil)
+	return encodeMsg(errResp)
 }
 
 // Proxy.service open connection to remote and service proxying data.
@@ -202,13 +214,13 @@ func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
 // recorded from that connection's BackendKeyData - and forwards the raw
 // CancelRequest to that same backend, exactly as a direct client would.
 func (p *Proxy) forwardCancelRequest(cr *pgproto3.CancelRequest) {
-	v, ok := cancelRegistry.Load(cr.ProcessID)
+	v, ok := cancelRegistry.Load(cancelKey{pid: cr.ProcessID, secret: *(*[4]byte)(cr.SecretKey)})
 	if !ok {
 		glog.Warningf("%sCancelRequest for unknown backend PID %d", p.prefix, cr.ProcessID)
 		return
 	}
 	sess := v.(backendSession)
-	if sess.secretKey != cr.SecretKey {
+	if sess.secretKey != *(*[4]byte)(cr.SecretKey) {
 		glog.Warningf("%sCancelRequest secret mismatch for backend PID %d", p.prefix, cr.ProcessID)
 		return
 	}
@@ -219,7 +231,7 @@ func (p *Proxy) forwardCancelRequest(cr *pgproto3.CancelRequest) {
 		return
 	}
 	defer conn.Close()
-	if _, err := conn.Write(cr.Encode(nil)); err != nil {
+	if _, err := conn.Write(encodeMsg(cr)); err != nil {
 		glog.Errorf("%sCancelRequest: failed to send: %v", p.prefix, err)
 	}
 }
@@ -228,14 +240,14 @@ func (p *Proxy) serviceStartup(sm *pgproto3.StartupMessage, dbs map[string]DBCon
 	dbName := sm.Parameters["database"]
 	dbConf, ok := dbs[dbName]
 	if !ok {
-		p.writeError("FATAL", "database not found in proxy config: "+dbName)
+		p.writeError("FATAL", "database not found in proxy config: "+dbName, "3D000")
 		p.err("Database not configured: "+dbName, nil)
 		return
 	}
 
 	rconn, target, err := connectBackend(dbConf, sm)
 	if err != nil {
-		p.writeError("FATAL", "backend connection failed: "+err.Error())
+		p.writeError("FATAL", "backend connection failed: "+err.Error(), "08006")
 		p.err("Remote connection failed", err)
 		return
 	}
@@ -270,7 +282,7 @@ func (p *Proxy) serviceStartup(sm *pgproto3.StartupMessage, dbs map[string]DBCon
 // and losslessly re-encoded unmodified, so binary parameters, OIDs and
 // portal/statement names are never mangled.
 func (p *Proxy) handleIncomingConnection(handler Handler, authTypeCh <-chan uint32) {
-	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(p.lconn), p.lconn)
+	backend := pgproto3.NewBackend(p.lconn, p.lconn)
 
 	for {
 		// Drain any authentication-type updates the response side learned
@@ -297,9 +309,14 @@ func (p *Proxy) handleIncomingConnection(handler Handler, authTypeCh <-chan uint
 
 		out, herr := p.applyFrontendHandler(msg, handler)
 		if herr != nil {
-			p.writeError("ERROR", herr.Error())
-			p.err("Query blocked", herr)
-			return
+			p.writeError("ERROR", herr.Error(), "42501")
+			// Keep session alive for blocked queries (H1)
+			if _, ok := msg.(*pgproto3.Query); ok {
+				p.lconnMutex.Lock()
+				_, _ = p.lconn.Write(encodeMsg(&pgproto3.ReadyForQuery{TxStatus: 'I'}))
+				p.lconnMutex.Unlock()
+			}
+			continue
 		}
 
 		if _, err := p.rconn.Write(out); err != nil {
@@ -323,16 +340,16 @@ func (p *Proxy) applyFrontendHandler(msg pgproto3.FrontendMessage, handler Handl
 		if err != nil {
 			return nil, err
 		}
-		return (&pgproto3.Query{String: text}).Encode(nil), nil
+		return encodeMsg(&pgproto3.Query{String: text}), nil
 	case *pgproto3.Parse:
 		text, err := runHandler(handler, m.Query)
 		if err != nil {
 			return nil, err
 		}
 		out := &pgproto3.Parse{Name: m.Name, Query: text, ParameterOIDs: m.ParameterOIDs}
-		return out.Encode(nil), nil
+		return encodeMsg(out), nil
 	default:
-		return msg.Encode(nil), nil
+		return encodeMsg(msg), nil
 	}
 }
 
@@ -358,7 +375,7 @@ func runHandler(handler Handler, query string) (string, error) {
 // client's reply) and BackendKeyData (to support CancelRequest), then
 // forwards every message re-encoded verbatim.
 func (p *Proxy) handleResponseConnection(target backendTarget, authTypeCh chan<- uint32, pidRegistered *atomic.Uint32) {
-	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(p.rconn), p.rconn)
+	frontend := pgproto3.NewFrontend(p.rconn, p.rconn)
 
 	for {
 		msg, err := frontend.Receive()
@@ -382,14 +399,29 @@ func (p *Proxy) handleResponseConnection(target backendTarget, authTypeCh chan<-
 			authTypeCh <- pgproto3.AuthTypeSASLContinue
 		case *pgproto3.AuthenticationSASLFinal:
 			authTypeCh <- pgproto3.AuthTypeSASLFinal
+		case *pgproto3.AuthenticationGSS:
+			authTypeCh <- pgproto3.AuthTypeGSS
+		case *pgproto3.AuthenticationGSSContinue:
+			authTypeCh <- pgproto3.AuthTypeGSSCont
 		case *pgproto3.BackendKeyData:
-			cancelRegistry.Store(m.ProcessID, backendSession{target: target, secretKey: m.SecretKey})
+			cancelRegistry.Store(
+				cancelKey{pid: m.ProcessID, secret: *(*[4]byte)(m.SecretKey)},
+				backendSession{target: target, secretKey: *(*[4]byte)(m.SecretKey)},
+			)
 			pidRegistered.Store(m.ProcessID + 1)
 		}
 
-		if _, err := p.lconn.Write(msg.Encode(nil)); err != nil {
+		p.lconnMutex.Lock()
+		_, err = p.lconn.Write(encodeMsg(msg))
+		p.lconnMutex.Unlock()
+		if err != nil {
 			p.err("Write to client failed", err)
 			return
 		}
 	}
+}
+
+func encodeMsg(msg pgproto3.Message) []byte {
+	b, _ := msg.Encode(nil)
+	return b
 }

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // TestApplyFrontendHandler tests applyFrontendHandler with various message
@@ -22,7 +22,7 @@ func TestApplyFrontendHandler(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := (&pgproto3.Query{String: "SELECT * FROM users;"}).Encode(nil)
+		want, _ := (&pgproto3.Query{String: "SELECT * FROM users;"}).Encode(nil)
 		if !bytes.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
@@ -35,7 +35,7 @@ func TestApplyFrontendHandler(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := (&pgproto3.Query{String: "SELECT * FROM orgs;"}).Encode(nil)
+		want, _ := (&pgproto3.Query{String: "SELECT * FROM orgs;"}).Encode(nil)
 		if !bytes.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
@@ -48,7 +48,7 @@ func TestApplyFrontendHandler(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+		want, _ := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
 		if !bytes.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
@@ -69,7 +69,7 @@ func TestApplyFrontendHandler(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := (&pgproto3.Parse{Name: "stmt1", Query: "SELECT * FROM orgs", ParameterOIDs: []uint32{23, 25}}).Encode(nil)
+		want, _ := (&pgproto3.Parse{Name: "stmt1", Query: "SELECT * FROM orgs", ParameterOIDs: []uint32{23, 25}}).Encode(nil)
 		if !bytes.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
@@ -90,7 +90,7 @@ func TestApplyFrontendHandler(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := msg.Encode(nil)
+		want := encodeMsg(msg)
 		if !bytes.Equal(got, want) {
 			t.Errorf("Bind message was altered:\n got  %v\n want %v", got, want)
 		}
@@ -102,7 +102,7 @@ func TestApplyFrontendHandler(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !bytes.Equal(got, msg.Encode(nil)) {
+		if !bytes.Equal(got, encodeMsg(msg)) {
 			t.Errorf("Terminate message was altered")
 		}
 	})
@@ -129,14 +129,14 @@ func TestMessageParsing(t *testing.T) {
 	// Test creating a simple query message
 	query := "SELECT * FROM users;"
 	qMsg := &pgproto3.Query{String: query}
-	msg := qMsg.Encode(nil)
+	msg, _ := qMsg.Encode(nil)
 
 	// Verify it encodes correctly
 	if msg[0] != 'Q' {
 		t.Errorf("Expected 'Q' prefix")
 	}
 	// Extract query string
-	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(bytes.NewReader(msg)), nil)
+	backend := pgproto3.NewBackend(bytes.NewReader(msg), nil)
 	decoded, _ := backend.Receive()
 	if q, ok := decoded.(*pgproto3.Query); !ok || q.String != query {
 		t.Errorf("Query string mismatch")
@@ -144,7 +144,7 @@ func TestMessageParsing(t *testing.T) {
 }
 
 func TestBuildErrorResponse(t *testing.T) {
-	resp := buildErrorResponse("FATAL", "test error message")
+	resp := buildErrorResponse("FATAL", "test error message", "XX000")
 
 	// The response should be a valid pgproto3.ErrorResponse message
 	// It should start with 'E'

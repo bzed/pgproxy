@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // DBConfig holds the configuration for a target database.
@@ -58,7 +58,7 @@ func targetFor(addr string) backendTarget {
 // The returned message is either *pgproto3.StartupMessage or
 // *pgproto3.CancelRequest.
 func readStartupMessage(conn net.Conn) (pgproto3.FrontendMessage, error) {
-	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
+	backend := pgproto3.NewBackend(conn, conn)
 	for {
 		msg, err := backend.ReceiveStartupMessage()
 		if err != nil {
@@ -147,7 +147,7 @@ func connectBackend(db DBConfig, sm *pgproto3.StartupMessage) (net.Conn, backend
 	}
 
 	// 1. Send SSLRequest
-	sslReq := (&pgproto3.SSLRequest{}).Encode(nil)
+	sslReq := encodeMsg(&pgproto3.SSLRequest{})
 	if _, err := conn.Write(sslReq); err != nil {
 		conn.Close()
 		return nil, target, err
@@ -168,7 +168,7 @@ func connectBackend(db DBConfig, sm *pgproto3.StartupMessage) (net.Conn, backend
 
 	// 2. Forward the (database-rewritten) StartupMessage.
 	backendStartup := rewriteStartupMessage(sm, db)
-	if _, err := conn.Write(backendStartup.Encode(nil)); err != nil {
+	if _, err := conn.Write(encodeMsg(backendStartup)); err != nil {
 		conn.Close()
 		return nil, target, err
 	}
