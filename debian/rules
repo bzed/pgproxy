@@ -6,10 +6,10 @@ export GOCACHE=/tmp/go-cache
 	dh $@
 
 override_dh_auto_build:
-	go build -v -o pgproxy
+	go build -buildvcs=false -v -o pgproxy
 
 override_dh_auto_test:
-	go test -v ./...
+	go test -buildvcs=false -v ./...
 
 override_dh_auto_install:
 	# Handled by install files
