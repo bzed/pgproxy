@@ -53,7 +53,24 @@ type QueryFilter struct {
 
 // NewQueryFilter creates a new QueryFilter with the given configuration.
 func NewQueryFilter(config FilterConfig) *QueryFilter {
+	WarnIfFilterConfigIsUnsafe(config, glog.Warningf)
 	return &QueryFilter{config: config}
+}
+
+// WarnIfFilterConfigIsUnsafe logs a loud warning (via warnf, e.g.
+// glog.Warningf) when the signature-filter configuration blocks every
+// statement: signature_filter_enabled is true,
+// signature_allow_by_default is false, and allow_signatures is empty. That
+// combination is almost certainly a configuration mistake rather than an
+// intentional "block everything" firewall, and every blocked query kills
+// the client connection (see the Handler doc comment).
+func WarnIfFilterConfigIsUnsafe(config FilterConfig, warnf func(format string, args ...interface{})) {
+	if config.SignatureFilterEnabled && !config.SignatureAllowByDefault && len(config.AllowSignatures) == 0 {
+		warnf("Filter config: signature_filter_enabled=true, signature_allow_by_default=false and " +
+			"allow_signatures is empty - EVERY statement will be blocked (and, per the current Handler " +
+			"behavior, every client connection killed). Add entries to allow_signatures, set " +
+			"signature_allow_by_default=true, or set signature_filter_enabled=false.")
+	}
 }
 
 // Filter checks if the SQL statement meets the configured criteria.

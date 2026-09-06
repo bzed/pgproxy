@@ -4,145 +4,123 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"github.com/jackc/pgproto3/v2"
 	"testing"
+
+	"github.com/jackc/pgproto3/v2"
 )
 
-// TestHandleQueryFunc tests the HandleQuery function with various inputs
-func TestHandleQueryFunc(t *testing.T) {
-	tests := []struct {
-		name        string
-		msgType     byte
-		content     []byte
-		handler     Handler
-		wantContent []byte
-		wantErr     bool
-	}{
-		{
-			name:    "Simple SELECT query - passthrough",
-			msgType: SimpleQuery,
-			content: []byte("SELECT * FROM users;\x00"),
-			handler: func(query string) ([]byte, error) {
-				return []byte(query), nil
-			},
-			wantContent: []byte("SELECT * FROM users;\x00"),
-			wantErr:     false,
-		},
-		{
-			name:    "Simple SELECT query - modified",
-			msgType: SimpleQuery,
-			content: []byte("SELECT * FROM users;\x00"),
-			handler: func(query string) ([]byte, error) {
-				return []byte("SELECT * FROM orgs;"), nil
-			},
-			wantContent: []byte("SELECT * FROM orgs;\x00"),
-			wantErr:     false,
-		},
-		{
-			name:    "Query without null terminator",
-			msgType: SimpleQuery,
-			content: []byte("SELECT 1"),
-			handler: func(query string) ([]byte, error) {
-				return []byte(query), nil
-			},
-			wantContent: []byte("SELECT 1\x00"),
-			wantErr:     false,
-		},
-		{
-			name:    "Handler returns error",
-			msgType: SimpleQuery,
-			content: []byte("SELECT * FROM users"),
-			handler: func(query string) ([]byte, error) {
-				return nil, errors.New("handler error")
-			},
-			wantContent: nil,
-			wantErr:     true,
-		},
-		{
-			name:    "Handler returns nil data",
-			msgType: SimpleQuery,
-			content: []byte("SELECT 1\x00"),
-			handler: func(query string) ([]byte, error) {
-				return nil, nil
-			},
-			wantContent: []byte("SELECT 1\x00"),
-			wantErr:     false,
-		},
-		{
-			name:    "Empty content",
-			msgType: SimpleQuery,
-			content: []byte(""),
-			handler: func(query string) ([]byte, error) {
-				return []byte("SELECT 1"), nil
-			},
-			wantContent: []byte("SELECT 1\x00"),
-			wantErr:     false,
-		},
-		{
-			name:    "Parse message - passthrough",
-			msgType: ParseMsg,
-			content: []byte("my_query\x00"),
-			handler: func(query string) ([]byte, error) {
-				return []byte(query), nil
-			},
-			wantContent: []byte("my_query\x00"),
-			wantErr:     false,
-		},
-		{
-			name:    "Unknown message type - passthrough",
-			msgType: 'X', // Terminate
-			content: []byte("some content\x00"),
-			handler: func(query string) ([]byte, error) {
-				return []byte(query), nil
-			},
-			wantContent: []byte("some content\x00"),
-			wantErr:     false,
-		},
-	}
+// TestApplyFrontendHandler tests applyFrontendHandler with various message
+// types, in particular that Bind messages (and their binary parameters) are
+// forwarded byte-for-byte instead of being run through the SQL handler.
+func TestApplyFrontendHandler(t *testing.T) {
+	p := &Proxy{}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := HandleQuery(tt.msgType, tt.content, tt.handler)
+	t.Run("Query - passthrough", func(t *testing.T) {
+		handler := func(query string) ([]byte, error) { return []byte(query), nil }
+		msg := &pgproto3.Query{String: "SELECT * FROM users;"}
+		got, err := p.applyFrontendHandler(msg, handler)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := (&pgproto3.Query{String: "SELECT * FROM users;"}).Encode(nil)
+		if !bytes.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
 
-			if (err != nil) != tt.wantErr {
-				t.Errorf("HandleQuery() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
+	t.Run("Query - rewritten", func(t *testing.T) {
+		handler := func(query string) ([]byte, error) { return []byte("SELECT * FROM orgs;"), nil }
+		msg := &pgproto3.Query{String: "SELECT * FROM users;"}
+		got, err := p.applyFrontendHandler(msg, handler)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := (&pgproto3.Query{String: "SELECT * FROM orgs;"}).Encode(nil)
+		if !bytes.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
 
-			if !bytes.Equal(got, tt.wantContent) {
-				t.Errorf("HandleQuery() = %v, want %v", got, tt.wantContent)
-			}
-		})
-	}
+	t.Run("Query - handler nil result means passthrough", func(t *testing.T) {
+		handler := func(query string) ([]byte, error) { return nil, nil }
+		msg := &pgproto3.Query{String: "SELECT 1"}
+		got, err := p.applyFrontendHandler(msg, handler)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+		if !bytes.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Query - handler error blocks", func(t *testing.T) {
+		handler := func(query string) ([]byte, error) { return nil, errors.New("blocked") }
+		msg := &pgproto3.Query{String: "DELETE FROM users"}
+		if _, err := p.applyFrontendHandler(msg, handler); err == nil {
+			t.Error("expected an error, got nil")
+		}
+	})
+
+	t.Run("Parse - query text is filtered, name and OIDs preserved", func(t *testing.T) {
+		handler := func(query string) ([]byte, error) { return []byte("SELECT * FROM orgs"), nil }
+		msg := &pgproto3.Parse{Name: "stmt1", Query: "SELECT * FROM users", ParameterOIDs: []uint32{23, 25}}
+		got, err := p.applyFrontendHandler(msg, handler)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := (&pgproto3.Parse{Name: "stmt1", Query: "SELECT * FROM orgs", ParameterOIDs: []uint32{23, 25}}).Encode(nil)
+		if !bytes.Equal(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Bind - forwarded verbatim, binary parameters untouched", func(t *testing.T) {
+		// A handler that would corrupt anything it's actually given as a
+		// "query" string, to prove Bind's binary payload never reaches it.
+		handler := func(query string) ([]byte, error) { return []byte("CORRUPTED"), nil }
+		msg := &pgproto3.Bind{
+			DestinationPortal:    "",
+			PreparedStatement:    "stmt1",
+			ParameterFormatCodes: []int16{1},
+			Parameters:           [][]byte{{0x00, 0x00, 0x00, 0x2a}}, // binary int4 = 42
+			ResultFormatCodes:    []int16{1},
+		}
+		got, err := p.applyFrontendHandler(msg, handler)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := msg.Encode(nil)
+		if !bytes.Equal(got, want) {
+			t.Errorf("Bind message was altered:\n got  %v\n want %v", got, want)
+		}
+	})
+
+	t.Run("Terminate - forwarded verbatim", func(t *testing.T) {
+		msg := &pgproto3.Terminate{}
+		got, err := p.applyFrontendHandler(msg, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(got, msg.Encode(nil)) {
+			t.Errorf("Terminate message was altered")
+		}
+	})
 }
 
-// TestBufferPool tests the buffer pool functionality
-func TestBufferPool(t *testing.T) {
-	pool := &bufferPool{}
-
-	// Get a buffer
-	buf1 := pool.Get()
-	if len(buf1) != 65536 {
-		t.Errorf("Expected buffer length 65536, got %d", len(buf1))
+func TestRunHandler(t *testing.T) {
+	if s, err := runHandler(nil, "SELECT 1"); err != nil || s != "SELECT 1" {
+		t.Errorf("nil handler should passthrough, got (%q, %v)", s, err)
 	}
 
-	// Put it back
-	pool.Put(buf1)
-
-	// Get another buffer (should reuse)
-	buf2 := pool.Get()
-	if len(buf2) != 65536 {
-		t.Errorf("Expected buffer length 65536, got %d", len(buf2))
+	nilHandler := func(query string) ([]byte, error) { return nil, nil }
+	if s, err := runHandler(nilHandler, "SELECT 1"); err != nil || s != "SELECT 1" {
+		t.Errorf("handler returning nil should passthrough, got (%q, %v)", s, err)
 	}
 
-	// Test with small buffer (should not be pooled)
-	smallBuf := make([]byte, 100)
-	pool.Put(smallBuf)
-
-	// Get should still return 65536 buffer
-	buf3 := pool.Get()
-	if len(buf3) != 65536 {
-		t.Errorf("Expected buffer length 65536 after small put, got %d", len(buf3))
+	errHandler := func(query string) ([]byte, error) { return nil, errors.New("boom") }
+	if _, err := runHandler(errHandler, "SELECT 1"); err == nil {
+		t.Error("expected error to propagate")
 	}
 }
 
@@ -162,33 +140,6 @@ func TestMessageParsing(t *testing.T) {
 	decoded, _ := backend.Receive()
 	if q, ok := decoded.(*pgproto3.Query); !ok || q.String != query {
 		t.Errorf("Query string mismatch")
-	}
-}
-
-// TestIsQueryMessage tests the isQueryMessage function
-func TestIsQueryMessage(t *testing.T) {
-	tests := []struct {
-		msgType byte
-		want    bool
-	}{
-		{'Q', true},  // SimpleQuery
-		{'P', true},  // ParseMsg
-		{'B', true},  // BindMsg
-		{'E', false}, // ExecuteMsg
-		{'D', false}, // DescribeMsg
-		{'C', false}, // CloseMsg
-		{'S', false}, // SyncMsg
-		{'X', false}, // Terminate
-		{'R', false}, // Unknown
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.msgType), func(t *testing.T) {
-			got := isQueryMessage(tt.msgType)
-			if got != tt.want {
-				t.Errorf("isQueryMessage(%c) = %v, want %v", tt.msgType, got, tt.want)
-			}
-		})
 	}
 }
 

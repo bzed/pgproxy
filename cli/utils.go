@@ -9,21 +9,18 @@ package cli
 import (
 	"fmt"
 	"os"
-	"strings"
-	"syscall"
 
 	"github.com/BurntSushi/toml"
 	"github.com/bzed/pgproxy/parser"
 	"github.com/bzed/pgproxy/proxy"
-	"github.com/golang/glog"
 )
 
 const Logo = `
     ____  ____ _____  _________  _  ____  __
    / __ \/ __ '/ __ \/ ___/ __ \| |/_/ / / /
-  / /_/ / /_/ / /_/ / /  / /_/ />  </ /_/ / 
- / .___/\__, / .___/_/   \____/_/|_|\__, /  
-/_/    /____/_/                    /____/   
+  / /_/ / /_/ / /_/ / /  / /_/ />  </ /_/ /
+ / .___/\__, / .___/_/   \____/_/|_|\__, /
+/_/    /____/_/                    /____/
 `
 
 const (
@@ -39,30 +36,21 @@ type ProxyConfig struct {
 	FilterConfig parser.FilterConfig       `toml:"Filter"`
 }
 
-func readConfig(file string) (pc ProxyConfig, connStr string) {
+func readConfig(file string) (ProxyConfig, error) {
+	var pc ProxyConfig
 	pc.FilterConfig = parser.DefaultFilterConfig()
 
 	if _, err := os.Stat(file); os.IsNotExist(err) {
-		glog.Errorln("Configuration file not found:", err)
-		os.Exit(int(syscall.ENOENT))
+		return pc, fmt.Errorf("configuration file not found: %w", err)
 	}
 
 	if _, err := toml.DecodeFile(file, &pc); err != nil {
-		glog.Fatalln("Failed to parse configuration file:", err)
+		return pc, fmt.Errorf("failed to parse configuration file: %w", err)
 	}
 
-	// Check if master database is configured
 	if _, ok := pc.DB["master"]; !ok {
-		glog.Fatalln("Configuration error: DB.master not found in configuration file")
+		return pc, fmt.Errorf("configuration error: DB.master not found in configuration file")
 	}
 
-	master := pc.DB["master"]
-	sepindex := strings.Index(master.Addr, ":")
-
-	if sepindex == -1 {
-		glog.Fatalln("Invalid database address format in configuration. Expected 'host:port'")
-	}
-
-	return pc, fmt.Sprintf("host=%s port=%s dbname=%s application_name=pgproxy sslmode=disable",
-		master.Addr[0:sepindex], master.Addr[(sepindex+1):], master.DBName)
+	return pc, nil
 }

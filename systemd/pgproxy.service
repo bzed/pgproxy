@@ -3,10 +3,10 @@ Description=pgproxy - PostgreSQL proxy server
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 User=postgres
 Group=postgres
-ExecStart=/usr/local/bin/pgproxy start -c /etc/pgproxy/pgproxy.conf
+ExecStart=/usr/local/bin/pgproxy -config /etc/pgproxy/pgproxy.conf -logtostderr=true
 Restart=on-failure
 
 # Security hardening

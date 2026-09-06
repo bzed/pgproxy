@@ -25,21 +25,26 @@ $ go get -u github.com/bzed/pgproxy
 
 ### As a separate application
 
-Start or shut down the proxy server.
 ```
-$ pgproxy start/stop
-```
-
-Use pgproxy on the command line
-```
-$ pgproxy cli
+$ pgproxy -config /etc/pgproxy/pgproxy.conf
 ```
 
-Note: You can use it as you would with a native command line.
+pgproxy runs in the foreground and shuts down gracefully on SIGINT/SIGTERM
+(it also notifies systemd of readiness and of shutdown when run under
+`Type=notify`, see `systemd/pgproxy.service` / `debian/pgproxy.service`).
+There is no separate `start`/`stop`/`cli` subcommand.
 
 ### Using Configuration
 
 pgproxy is configured using a TOML file (default: `pgproxy.conf`).
+
+pgproxy never learns client passwords: it authenticates connections by
+routing the client's `StartupMessage` (with the `database` parameter
+rewritten to the backend's real database name) to the target backend and
+then relaying the authentication handshake unmodified, so the client
+authenticates directly against the backend's own credentials. Because of
+this, `[DB.*]` entries only need `Addr` and `DBName` - there is no `User`/
+`Password` to configure here.
 
 ```toml
 [ServerConfig]
@@ -50,20 +55,18 @@ pgproxy is configured using a TOML file (default: `pgproxy.conf`).
 [DB]
     [DB.master]
         Addr = "127.0.0.1:5432"
-        User = "postgres"
-        Password = "testpass"
         DBName = "testdb"
-        
+
     [DB.reports]
         Addr = "10.0.0.5:5432"
-        User = "reportuser"
-        Password = "reportpassword"
         DBName = "reportsdb"
+        # Verify the backend's certificate against a CA instead of just
+        # encrypting the link (see "Backend TLS" below).
+        TLSRootCert = "/etc/pgproxy/reports-ca.pem"
+        # TLSServerName = "reports.internal"
 
     [DB.local_socket]
         Addr = "/var/run/postgresql/.s.PGSQL.5432" # Connect to backend via Unix Socket
-        User = "postgres"
-        Password = "secretpassword"
         DBName = "postgres"
 
 [Filter]
@@ -82,6 +85,24 @@ pgproxy is configured using a TOML file (default: `pgproxy.conf`).
     # allow_signatures = ["SELECT id FROM allowed_table"]
 ```
 
+#### Backend TLS
+
+If a backend answers with SSL support, pgproxy always encrypts the
+proxy<->backend link. By default it does not verify the backend's
+certificate (equivalent to libpq's `sslmode=require`), because most
+deployments point at a backend on trusted infrastructure without a CA-issued
+cert. Set `TLSRootCert` (a PEM file) on a `[DB.*]` entry to verify the
+backend's certificate against that CA instead (equivalent to
+`verify-ca`/`verify-full`); `TLSServerName` overrides the hostname checked
+against the certificate when it differs from `Addr`.
+
+#### Query cancellation
+
+`psql`'s Ctrl-C and driver-level query cancellation (a `CancelRequest` sent
+on a fresh connection) are supported: pgproxy remembers which backend a
+session's `BackendKeyData` belongs to and forwards the cancellation to that
+same backend.
+
 ### Be called as a package
 
 [package_example](https://github.com/bzed/pgproxy/blob/master/examples/package_example/package_example.go)
@@ -99,16 +120,14 @@ import (
 )
 
 func main() {
-	// call proxy
-	cli.Main("../pgproxy.conf", []string{"pgproxy", "start"})
+	// call proxy; empty configPath falls back to the -config flag
+	cli.Main("../pgproxy.conf")
 
 	// Capture ctrl-c for graceful exit
 	chExit := make(chan os.Signal, 1)
-	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
-	select {
-	case <-chExit:
-		fmt.Println("Example EXITING...Bye.")
-	}
+	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM)
+	<-chExit
+	fmt.Println("Example EXITING...Bye.")
 }
 ```
 
@@ -134,6 +153,17 @@ sudo systemctl enable --now pgproxy
 pgproxy uses [postgresql-parser](https://github.com/auxten/postgresql-parser), a robust SQL parser extracted from CockroachDB. This provides comprehensive, native support for PostgreSQL syntax, data types, and keywords, making it far superior to legacy MySQL-based parsers.
 
 Supports parsing and rewriting for a broad array of PostgreSQL statements including `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and many advanced SQL operations.
+
+**Filter scope**: the per-statement-type rules (`allow_select`, `allow_insert`, ...) and the `require_where_for_*`
+rules only apply to `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` and `ALTER ROLE`. Any other statement type
+(`CREATE`, `DROP`, `GRANT`, `COPY`, `SET`, ...) is **allowed by default** unless it also matches
+`signature_filter_enabled`'s block/allow list. If you rely on pgproxy as a firewall against those statement types,
+use signature-based filtering (or restrict backend-side privileges) rather than the per-statement-type rules alone.
+
+**Signature filtering footgun**: if you set `signature_filter_enabled = true` and `signature_allow_by_default = false`
+without populating `allow_signatures`, pgproxy will block *every* statement (a blocked statement currently closes
+the client's connection with an error - see below). pgproxy logs a warning at startup when it detects this
+combination; treat it as a configuration error.
 
 ## Credits
 

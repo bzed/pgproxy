@@ -20,12 +20,16 @@ import (
 // MockPgServer is a simple TCP server that mocks PostgreSQL
 // It tracks queries received and responds with simple mock data
 type MockPgServer struct {
-	listener     net.Listener
-	queries      []string
-	mu           sync.Mutex
-	closeChan    chan struct{}
-	closeWg      sync.WaitGroup
-	queryHandler func(query string) error
+	listener      net.Listener
+	queries       []string
+	startupDBs    []string // "database" startup parameter of each connection, in order
+	mu            sync.Mutex
+	closeChan     chan struct{}
+	closeWg       sync.WaitGroup
+	queryHandler  func(query string) error
+	backendPID    uint32 // BackendKeyData handed out to connections (fixed, for tests)
+	backendSecret uint32
+	cancelled     chan [2]uint32 // (PID, secret) of each CancelRequest received, buffered
 }
 
 // NewMockPgServer creates a new mock PostgreSQL server
@@ -35,10 +39,23 @@ func NewMockPgServer() (*MockPgServer, error) {
 		return nil, err
 	}
 	return &MockPgServer{
-		listener:  listener,
-		queries:   make([]string, 0),
-		closeChan: make(chan struct{}),
+		listener:      listener,
+		queries:       make([]string, 0),
+		closeChan:     make(chan struct{}),
+		backendPID:    4242,
+		backendSecret: 13579,
+		cancelled:     make(chan [2]uint32, 8),
 	}, nil
+}
+
+// StartupDatabases returns the "database" startup parameter seen on each
+// connection, in the order connections arrived.
+func (m *MockPgServer) StartupDatabases() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]string, len(m.startupDBs))
+	copy(result, m.startupDBs)
+	return result
 }
 
 // Addr returns the server address
@@ -130,6 +147,32 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 				continue
 			}
 
+			// CancelRequest: code(4) + PID(4) + secret(4), sent on its own
+			// connection instead of a real startup. Record it and hang up,
+			// like a real backend would.
+			if code == 80877102 {
+				if len(content) >= 12 {
+					pid := binary.BigEndian.Uint32(content[4:8])
+					secret := binary.BigEndian.Uint32(content[8:12])
+					select {
+					case m.cancelled <- [2]uint32{pid, secret}:
+					default:
+					}
+				}
+				return
+			}
+
+			// StartupMessage: code(4) is the protocol version, followed by
+			// key\0value\0 pairs, terminated by a final \0.
+			if dbIdx := bytes.Index(content, []byte("database\x00")); dbIdx >= 0 {
+				rest := content[dbIdx+len("database\x00"):]
+				if end := bytes.IndexByte(rest, 0); end >= 0 {
+					m.mu.Lock()
+					m.startupDBs = append(m.startupDBs, string(rest[:end]))
+					m.mu.Unlock()
+				}
+			}
+
 			isStartup = false
 			msgType = 0 // StartupMessage
 		} else {
@@ -158,6 +201,8 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 		case 0: // StartupMessage
 			// Send AuthOk
 			conn.Write([]byte{'R', 0, 0, 0, 8, 0, 0, 0, 0})
+			// Send BackendKeyData, so the proxy can support CancelRequest.
+			conn.Write((&pgproto3.BackendKeyData{ProcessID: m.backendPID, SecretKey: m.backendSecret}).Encode(nil))
 			// Send ReadyForQuery
 			conn.Write([]byte{'Z', 0, 0, 0, 5, 'I'})
 
@@ -175,25 +220,26 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 				}
 			}
 
-			// Send RowDescription
+			// Send RowDescription: 1 field named "id", type int4 (OID 23),
+			// size 4, modifier -1, text format.
 			rdMsg := []byte{
 				'T',         // RowDescription
-				0, 0, 0, 18, // Length
-				0, 1, // 1 field
-				'i', 'd', 0, 0, 0, // field name "id"
+				0, 0, 0, 27, // Length (4 + body)
+				0, 1, // field count
+				'i', 'd', 0, // field name "id"
 				0, 0, 0, 0, // table OID
 				0, 0, // attribute number
-				23, 0, 0, 0, // data type (int4)
-				4, 0, 0, 0, // type length
-				0xff, 0xff, 0xff, 0xff, // type modifier (-1 as bytes)
-				0, // format
+				0, 0, 0, 23, // data type OID (int4)
+				0, 4, // data type size
+				0xff, 0xff, 0xff, 0xff, // type modifier (-1)
+				0, 0, // format code (text)
 			}
 			conn.Write(rdMsg)
 
 			// Send DataRow
 			drMsg := []byte{
-				'D',        // DataRow
-				0, 0, 0, 9, // Length
+				'D',         // DataRow
+				0, 0, 0, 14, // Length (4 + body)
 				0, 1, // 1 column
 				0, 0, 0, 4, // 4 bytes of data
 				0, 0, 0, 1, // int32 value 1
@@ -466,14 +512,8 @@ func TestProxyWithBlockingHandler(t *testing.T) {
 		t.Fatalf("Failed to write: %v", err)
 	}
 
-	// Connection should be closed by proxy
-	buf := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	_, err = conn.Read(buf)
-	// We expect an error (connection closed)
-	if err == nil {
-		t.Error("Expected connection to be closed after blocked query")
-	}
+	// The proxy should send an ErrorResponse and then close the connection.
+	expectBlockedQuery(t, conn)
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -745,14 +785,9 @@ func TestProxyWithPasswordChangeFilter(t *testing.T) {
 			t.Fatalf("Failed to write: %v", err)
 		}
 
-		// Connection should be closed by proxy due to blocked query
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		_, err = conn.Read(make([]byte, 1024))
+		// The proxy should send an ErrorResponse and then close the connection.
+		expectBlockedQuery(t, conn)
 		conn.Close()
-		// We expect an error (connection closed)
-		if err == nil {
-			t.Errorf("Password change query %q was not blocked", query)
-		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -866,13 +901,9 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 			t.Fatalf("Failed to write: %v", err)
 		}
 
-		// Connection should be closed by proxy
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		_, err = conn.Read(buf)
+		// The proxy should send an ErrorResponse and then close the connection.
+		expectBlockedQuery(t, conn)
 		conn.Close()
-		if err == nil {
-			t.Errorf("Query %q should have been blocked", query)
-		}
 		time.Sleep(100 * time.Millisecond)
 
 		// Verify query was not forwarded
@@ -880,6 +911,30 @@ func TestProxyWithReadOnlyFilter(t *testing.T) {
 		if len(queries) > 0 {
 			t.Errorf("Query %q should not have reached the mock server. Got: %v", query, queries)
 		}
+	}
+}
+
+// expectBlockedQuery reads the pgproto3.ErrorResponse the proxy sends when a
+// query is blocked (see H2: a blocked query now gets a real error rather
+// than an unexplained dropped connection), then confirms the proxy closes
+// the connection right after.
+func expectBlockedQuery(t *testing.T, conn net.Conn) {
+	t.Helper()
+
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(conn), conn)
+	msg, err := frontend.Receive()
+	if err != nil {
+		t.Fatalf("Expected an ErrorResponse for the blocked query, got read error: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.ErrorResponse); !ok {
+		t.Fatalf("Expected an ErrorResponse for the blocked query, got %T", msg)
+	}
+
+	// The proxy closes the session right after; confirm it does.
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := frontend.Receive(); err == nil {
+		t.Error("Expected connection to be closed after the blocked-query error")
 	}
 }
 
@@ -899,8 +954,8 @@ func performMockStartup(conn net.Conn) error {
 		return err
 	}
 
-	// Read AuthOk and ReadyForQuery
-	resp := make([]byte, 9+6)
+	// Read AuthOk, BackendKeyData and ReadyForQuery
+	resp := make([]byte, 9+13+6)
 	_, err = io.ReadFull(conn, resp)
 	return err
 }
@@ -914,9 +969,12 @@ func NewMockPgServerUnix(socketPath string) (*MockPgServer, error) {
 		return nil, err
 	}
 	return &MockPgServer{
-		listener:  listener,
-		queries:   make([]string, 0),
-		closeChan: make(chan struct{}),
+		listener:      listener,
+		queries:       make([]string, 0),
+		closeChan:     make(chan struct{}),
+		backendPID:    4242,
+		backendSecret: 13579,
+		cancelled:     make(chan [2]uint32, 8),
 	}, nil
 }
 
@@ -990,5 +1048,120 @@ func TestProxyWithUnixSocket(t *testing.T) {
 	queries := mock.QueriesReceived()
 	if len(queries) != 1 || queries[0] != "SELECT 1" {
 		t.Errorf("Expected mock to receive 'SELECT 1', got %v", queries)
+	}
+}
+
+// WaitForCancel blocks until a CancelRequest is received or timeout elapses.
+func (m *MockPgServer) WaitForCancel(timeout time.Duration) ([2]uint32, bool) {
+	select {
+	case v := <-m.cancelled:
+		return v, true
+	case <-time.After(timeout):
+		return [2]uint32{}, false
+	}
+}
+
+// TestProxyRewritesDatabaseName verifies that the backend sees its own real
+// database name (DBConfig.DBName), not the proxy config key the client used
+// to select it (H1).
+func TestProxyRewritesDatabaseName(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	proxyAddr := "127.0.0.1:29096"
+	dbs := map[string]DBConfig{
+		"clientkey": {Addr: "127.0.0.1:" + mock.Port(), DBName: "realdb"},
+	}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	if _, err := Start(proxyAddr, dbs, handler); err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	sm := &pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters:      map[string]string{"user": "postgres", "database": "clientkey"},
+	}
+	if _, err := conn.Write(sm.Encode(nil)); err != nil {
+		t.Fatalf("Failed to write startup message: %v", err)
+	}
+	resp := make([]byte, 9+13+6)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("Failed to read startup response: %v", err)
+	}
+
+	dbNames := mock.StartupDatabases()
+	if len(dbNames) != 1 || dbNames[0] != "realdb" {
+		t.Errorf("Expected backend to see database %q, got %v", "realdb", dbNames)
+	}
+}
+
+// TestProxyForwardsCancelRequest verifies that a CancelRequest arriving on a
+// fresh connection is forwarded to the same backend the original session's
+// BackendKeyData came from (H4).
+func TestProxyForwardsCancelRequest(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	proxyAddr := "127.0.0.1:29097"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	if _, err := Start(proxyAddr, dbs, handler); err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	// Establish the session whose query we'll "cancel".
+	sessionConn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer sessionConn.Close()
+	if err := performMockStartup(sessionConn); err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	// Give the response-relaying goroutine time to observe BackendKeyData
+	// and register it.
+	time.Sleep(100 * time.Millisecond)
+
+	// Send a CancelRequest on a brand new connection, as real clients do.
+	cancelConn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect for cancel: %v", err)
+	}
+	cr := &pgproto3.CancelRequest{ProcessID: mock.backendPID, SecretKey: mock.backendSecret}
+	if _, err := cancelConn.Write(cr.Encode(nil)); err != nil {
+		t.Fatalf("Failed to send CancelRequest: %v", err)
+	}
+	cancelConn.Close()
+
+	got, ok := mock.WaitForCancel(2 * time.Second)
+	if !ok {
+		t.Fatal("Backend never received the forwarded CancelRequest")
+	}
+	if got[0] != mock.backendPID || got[1] != mock.backendSecret {
+		t.Errorf("Backend received CancelRequest(%d, %d), want (%d, %d)",
+			got[0], got[1], mock.backendPID, mock.backendSecret)
 	}
 }

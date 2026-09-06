@@ -7,13 +7,12 @@
 package proxy
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -22,19 +21,35 @@ import (
 )
 
 var (
-	connid = uint64(0) // Self-increasing ConnectID.
+	connid uint64 // Self-increasing ConnectID, accessed only via atomic.
 )
 
 // Handler function from proxy to postgresql for rewrite
 // request or sql. Receives the query string and returns modified bytes.
 type Handler func(query string) ([]byte, error)
 
-// Start proxy server needed receive proxyHost, and database configs
-func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) {
-	defer glog.Flush()
+// backendSession records how to reach the backend a live connection is
+// talking to, keyed by the BackendKeyData (PID/secret) the backend assigned
+// it. It lets a later CancelRequest, which arrives on a brand new
+// connection, be forwarded to the right backend.
+type backendSession struct {
+	target    backendTarget
+	secretKey uint32
+}
+
+var cancelRegistry sync.Map // map[uint32(processID)]backendSession
+
+// Start proxy server needed receive proxyHost, and database configs.
+// It binds the listener synchronously and returns immediately; connections
+// are accepted in a background goroutine. The returned stop function closes
+// the listener and stops accepting new connections, for graceful shutdown.
+func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) (stop func(), err error) {
 	glog.Infof("Proxying from %v with %d configured databases\n", proxyHost, len(dbs))
 
-	listener := getListener(proxyHost)
+	listener, err := getListener(proxyHost)
+	if err != nil {
+		return nil, err
+	}
 
 	// Notify systemd that the service is ready
 	if ok, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
@@ -43,33 +58,56 @@ func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) {
 		glog.Infof("Systemd notified successfully")
 	}
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			glog.Errorf("Failed to accept connection '%s'\n", err)
-			continue
-		}
-		connid++
+	stopping := make(chan struct{})
+	var wg sync.WaitGroup
 
-		p := &Proxy{
-			lconn:   conn,
-			erred:   false,
-			errsig:  make(chan bool),
-			prefix:  fmt.Sprintf("Connection #%03d ", connid),
-			connID:  connid,
-			bufPool: &bufferPool{},
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-stopping:
+					// Expected: listener was closed for shutdown.
+					return
+				default:
+					glog.Errorf("Failed to accept connection '%s'\n", err)
+					continue
+				}
+			}
+			id := atomic.AddUint64(&connid, 1)
+
+			p := &Proxy{
+				lconn:  conn,
+				errsig: make(chan struct{}),
+				prefix: fmt.Sprintf("Connection #%03d ", id),
+				connID: id,
+			}
+			go p.service(dbs, handler)
 		}
-		go p.service(dbs, handler)
+	}()
+
+	stop = func() {
+		close(stopping)
+		listener.Close()
+		wg.Wait()
 	}
+	return stop, nil
 }
 
 // Listener of a net.Addr.
-func getListener(host string) net.Listener {
+func getListener(host string) (net.Listener, error) {
 	// First, check for systemd socket activation
 	listeners, err := activation.Listeners()
 	if err == nil && len(listeners) > 0 {
-		glog.Infof("Using systemd socket activation")
-		return listeners[0]
+		if len(listeners) > 1 {
+			glog.Warningf("Systemd passed %d activated sockets, using only the first; ProxyAddr %q is ignored",
+				len(listeners), host)
+		} else {
+			glog.Infof("Using systemd socket activation; ProxyAddr %q is ignored", host)
+		}
+		return listeners[0], nil
 	}
 
 	var listener net.Listener
@@ -80,107 +118,54 @@ func getListener(host string) net.Listener {
 		listener, err = net.Listen("tcp", host)
 	}
 	if err != nil {
-		glog.Fatalf("Listen on %s error:%v", host, err)
+		return nil, fmt.Errorf("listen on %s: %w", host, err)
 	}
-	return listener
+	return listener, nil
 }
 
 // Proxy - Manages a Proxy connection, piping data between proxy and remote.
 type Proxy struct {
 	lconn, rconn net.Conn
-	erred        bool
-	errsig       chan bool
+	errOnce      sync.Once
+	errsig       chan struct{}
 	prefix       string
 	connID       uint64
-	bufPool      *bufferPool
-}
-
-// bufferPool provides buffer pooling for performance optimization
-type bufferPool struct {
-	pool sync.Pool
-}
-
-func (bp *bufferPool) Get() []byte {
-	if b := bp.pool.Get(); b != nil {
-		return *(b.(*[]byte))
-	}
-	return make([]byte, 65536) // 64KB default buffer
-}
-
-func (bp *bufferPool) Put(b []byte) {
-	// Only pool buffers that are reasonably sized
-	if cap(b) >= 4096 && cap(b) <= 65536 {
-		b = b[:cap(b)]
-		bp.pool.Put(&b)
-	}
 }
 
 // New - Create a new Proxy instance. Takes over local connection passed in,
 // and closes it when finished.
 func New(conn net.Conn, connid uint64) *Proxy {
 	return &Proxy{
-		lconn:   conn,
-		erred:   false,
-		errsig:  make(chan bool),
-		prefix:  fmt.Sprintf("Connection #%03d ", connid),
-		connID:  connid,
-		bufPool: &bufferPool{},
+		lconn:  conn,
+		errsig: make(chan struct{}),
+		prefix: fmt.Sprintf("Connection #%03d ", connid),
+		connID: connid,
 	}
 }
 
-// proxy.err
-func (p *Proxy) err(s string, err error) {
-	if p.erred {
-		return
-	}
-	if err != io.EOF {
-		glog.Errorf(p.prefix+s, err)
-	}
-	p.errsig <- true
-	p.erred = true
+// err records the first error for this connection and unblocks service().
+// It is safe to call concurrently and safe to call more than once: only the
+// first call logs and signals, later calls are no-ops (previously this used
+// a plain bool guard plus an unbuffered channel send, which both raced
+// across the two pipe goroutines and deadlocked forever whenever both
+// directions failed at once, since only one of them could ever receive on
+// errsig).
+func (p *Proxy) err(msg string, err error) {
+	p.errOnce.Do(func() {
+		if err != nil && err != io.EOF {
+			glog.Errorf("%s%s: %v", p.prefix, msg, err)
+		} else if err == nil {
+			glog.Errorf("%s%s", p.prefix, msg)
+		}
+		close(p.errsig)
+	})
 }
 
-// Proxy.service open connection to remote and service proxying data.
-func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
-	defer p.lconn.Close()
-
-	// 1. Read StartupMessage from client
-	params, startupMsgBytes, err := readStartupMessage(p.lconn)
-	if err != nil {
-		p.err("Failed to read startup message: %s", err)
-		return
-	}
-	if params == nil {
-		p.err("Unsupported cancel request or empty startup", nil)
-		return
-	}
-
-	dbName := params["database"]
-	dbConf, ok := dbs[dbName]
-	if !ok {
-		errResp := buildErrorResponse("FATAL", "database not found in proxy config: "+dbName)
-		_, _ = p.lconn.Write(errResp)
-		p.err("Database not configured: "+dbName, nil)
-		return
-	}
-
-	// 2. Connect to backend and handle auth
-	rconn, err := connectBackend(dbConf, startupMsgBytes)
-	if err != nil {
-		errResp := buildErrorResponse("FATAL", "backend connection failed: "+err.Error())
-		_, _ = p.lconn.Write(errResp)
-		p.err("Remote connection failed: %s", err)
-		return
-	}
-	p.rconn = rconn
-	defer p.rconn.Close()
-
-	// proxying data
-	go p.handleIncomingConnection(p.lconn, p.rconn, handler)
-	go p.handleResponseConnection(p.rconn, p.lconn)
-
-	// wait for close...
-	<-p.errsig
+// writeError sends a pgproto3 ErrorResponse to the client. Best-effort: the
+// connection may already be broken, in which case the write error is
+// ignored since the caller is about to tear the session down anyway.
+func (p *Proxy) writeError(severity, message string) {
+	_, _ = p.lconn.Write(buildErrorResponse(severity, message))
 }
 
 func buildErrorResponse(severity, message string) []byte {
@@ -191,158 +176,220 @@ func buildErrorResponse(severity, message string) []byte {
 	return errResp.Encode(nil)
 }
 
-// PostgreSQL message types
-const (
-	SimpleQuery = 'Q' // Simple Query message
-	ParseMsg    = 'P' // Parse message
-	BindMsg     = 'B' // Bind message
-	ExecuteMsg  = 'E' // Execute message
-	DescribeMsg = 'D' // Describe message
-	CloseMsg    = 'C' // Close message
-	SyncMsg     = 'S' // Sync message
-	Terminate   = 'X' // Terminate message
-)
+// Proxy.service open connection to remote and service proxying data.
+func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
+	defer p.lconn.Close()
 
-// isQueryMessage returns true for message types that might contain SQL
-func isQueryMessage(msgType byte) bool {
-	switch msgType {
-	case SimpleQuery, ParseMsg, BindMsg:
-		return true
+	msg, err := readStartupMessage(p.lconn)
+	if err != nil {
+		p.err("Failed to read startup message", err)
+		return
 	}
-	return false
+
+	switch sm := msg.(type) {
+	case *pgproto3.CancelRequest:
+		p.forwardCancelRequest(sm)
+	case *pgproto3.StartupMessage:
+		p.serviceStartup(sm, dbs, handler)
+	default:
+		p.err("Unsupported startup message", fmt.Errorf("%T", msg))
+	}
 }
 
-// Proxy.handleIncomingConnection processes incoming client messages
-func (p *Proxy) handleIncomingConnection(src, dst net.Conn, customHandler Handler) {
-	buff := p.bufPool.Get()
-	defer p.bufPool.Put(buff)
+// forwardCancelRequest handles a CancelRequest, which PostgreSQL clients
+// send on a brand new connection (never on the connection running the
+// query). It looks up which backend the (PID, secret) pair belongs to -
+// recorded from that connection's BackendKeyData - and forwards the raw
+// CancelRequest to that same backend, exactly as a direct client would.
+func (p *Proxy) forwardCancelRequest(cr *pgproto3.CancelRequest) {
+	v, ok := cancelRegistry.Load(cr.ProcessID)
+	if !ok {
+		glog.Warningf("%sCancelRequest for unknown backend PID %d", p.prefix, cr.ProcessID)
+		return
+	}
+	sess := v.(backendSession)
+	if sess.secretKey != cr.SecretKey {
+		glog.Warningf("%sCancelRequest secret mismatch for backend PID %d", p.prefix, cr.ProcessID)
+		return
+	}
+
+	conn, err := net.Dial(sess.target.network, sess.target.addr)
+	if err != nil {
+		glog.Errorf("%sCancelRequest: failed to reach backend: %v", p.prefix, err)
+		return
+	}
+	defer conn.Close()
+	if _, err := conn.Write(cr.Encode(nil)); err != nil {
+		glog.Errorf("%sCancelRequest: failed to send: %v", p.prefix, err)
+	}
+}
+
+func (p *Proxy) serviceStartup(sm *pgproto3.StartupMessage, dbs map[string]DBConfig, handler Handler) {
+	dbName := sm.Parameters["database"]
+	dbConf, ok := dbs[dbName]
+	if !ok {
+		p.writeError("FATAL", "database not found in proxy config: "+dbName)
+		p.err("Database not configured: "+dbName, nil)
+		return
+	}
+
+	rconn, target, err := connectBackend(dbConf, sm)
+	if err != nil {
+		p.writeError("FATAL", "backend connection failed: "+err.Error())
+		p.err("Remote connection failed", err)
+		return
+	}
+	p.rconn = rconn
+	defer p.rconn.Close()
+
+	// authTypeCh carries the authentication type the backend just told the
+	// client about (Authentication{Cleartext,MD5,SASL...}) from the
+	// response-relaying goroutine to the request-relaying goroutine, which
+	// needs it to correctly disambiguate the client's next 'p' message
+	// (PasswordMessage vs SASL{Initial,}Response). Channel send/receive
+	// give the required happens-before edge; a shared field guarded only by
+	// protocol ordering would be a data race.
+	authTypeCh := make(chan uint32, 4)
+
+	var pidRegistered atomic.Uint32 // 0 = not yet, else the registered PID+1
+
+	go p.handleIncomingConnection(handler, authTypeCh)
+	go p.handleResponseConnection(target, authTypeCh, &pidRegistered)
+
+	// wait for close...
+	<-p.errsig
+
+	if pid := pidRegistered.Load(); pid != 0 {
+		cancelRegistry.Delete(pid - 1)
+	}
+}
+
+// handleIncomingConnection relays client -> backend messages, decoding just
+// enough (via pgproto3.Backend) to apply handler to the SQL text of Query
+// and Parse messages. All other message types (Bind included) are decoded
+// and losslessly re-encoded unmodified, so binary parameters, OIDs and
+// portal/statement names are never mangled.
+func (p *Proxy) handleIncomingConnection(handler Handler, authTypeCh <-chan uint32) {
+	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(p.lconn), p.lconn)
 
 	for {
-		// Read the first byte to determine message format
-		_, err := io.ReadFull(src, buff[:1])
+		// Drain any authentication-type updates the response side learned
+		// about, so Backend.Receive can correctly decode the client's next
+		// 'p' message.
+		for drained := false; !drained; {
+			select {
+			case at := <-authTypeCh:
+				_ = backend.SetAuthType(at)
+			default:
+				drained = true
+			}
+		}
+
+		msg, err := backend.Receive()
 		if err != nil {
 			if err == io.EOF {
 				p.err("Client closed connection", err)
 			} else {
-				p.err("Read header failed: %s\n", err)
+				p.err("Read from client failed", err)
 			}
 			return
 		}
 
-		var msgType byte
-		var msgLength uint32
-		var headerSize int
-
-		// If the first byte is 0x00, it's a StartupMessage, SSLRequest, or CancelRequest.
-		// These messages do not have a 1-byte message type; they start directly with a 4-byte length.
-		if buff[0] == 0 {
-			// Read the remaining 3 bytes of the 4-byte length
-			_, err = io.ReadFull(src, buff[1:4])
-			if err != nil {
-				p.err("Read length failed: %s\n", err)
-				return
-			}
-			msgType = 0
-			msgLength = binary.BigEndian.Uint32(buff[:4])
-			headerSize = 4
-		} else {
-			// Normal message: 1-byte type followed by 4-byte length
-			msgType = buff[0]
-			_, err = io.ReadFull(src, buff[1:5])
-			if err != nil {
-				p.err("Read length failed: %s\n", err)
-				return
-			}
-			msgLength = binary.BigEndian.Uint32(buff[1:5])
-			headerSize = 5
-		}
-
-		totalContentLength := int(msgLength) - 4
-		if totalContentLength < 0 {
-			p.err("Invalid message length", fmt.Errorf("invalid message length: %d", msgLength))
+		out, herr := p.applyFrontendHandler(msg, handler)
+		if herr != nil {
+			p.writeError("ERROR", herr.Error())
+			p.err("Query blocked", herr)
 			return
 		}
 
-		// Ensure buffer is large enough
-		if len(buff) < headerSize+totalContentLength {
-			newBuff := make([]byte, headerSize+totalContentLength)
-			copy(newBuff, buff[:headerSize])
-			p.bufPool.Put(buff)
-			buff = newBuff
+		if _, err := p.rconn.Write(out); err != nil {
+			p.err("Write to backend failed", err)
+			return
 		}
 
-		// Read the rest of the message content
-		if totalContentLength > 0 {
-			_, err = io.ReadFull(src, buff[headerSize:headerSize+totalContentLength])
-			if err != nil {
-				p.err("Read content failed: %s\n", err)
-				return
-			}
+		if _, ok := msg.(*pgproto3.Terminate); ok {
+			return
 		}
+	}
+}
 
-		fullMsg := buff[:headerSize+totalContentLength]
-
-		// Process the message if it's a query type (only normal messages have a type)
-		if msgType != 0 && isQueryMessage(msgType) && totalContentLength > 0 {
-			content := buff[headerSize : headerSize+totalContentLength]
-			modifiedContent, err := HandleQuery(msgType, content, customHandler)
-			if err != nil {
-				p.err("Query handling error: %s\n", err)
-				return
-			}
-
-			// Reconstruct message if content was modified
-			if modifiedContent != nil && !bytes.Equal(modifiedContent, content) {
-				newMsg := make([]byte, 5+len(modifiedContent))
-				newMsg[0] = msgType
-				binary.BigEndian.PutUint32(newMsg[1:5], uint32(len(modifiedContent)+4))
-				copy(newMsg[5:], modifiedContent)
-				fullMsg = newMsg
-			}
-		}
-
-		// Write to destination
-		_, err = dst.Write(fullMsg)
+// applyFrontendHandler runs handler over the SQL text of Query and Parse
+// messages and re-encodes the (possibly rewritten) message. Every other
+// message type is passed through as decoded/re-encoded verbatim.
+func (p *Proxy) applyFrontendHandler(msg pgproto3.FrontendMessage, handler Handler) ([]byte, error) {
+	switch m := msg.(type) {
+	case *pgproto3.Query:
+		text, err := runHandler(handler, m.String)
 		if err != nil {
-			p.err("Write failed: %s\n", err)
+			return nil, err
+		}
+		return (&pgproto3.Query{String: text}).Encode(nil), nil
+	case *pgproto3.Parse:
+		text, err := runHandler(handler, m.Query)
+		if err != nil {
+			return nil, err
+		}
+		out := &pgproto3.Parse{Name: m.Name, Query: text, ParameterOIDs: m.ParameterOIDs}
+		return out.Encode(nil), nil
+	default:
+		return msg.Encode(nil), nil
+	}
+}
+
+// runHandler calls handler with query, tolerating a nil handler (pure
+// passthrough) and a handler that signals "no change" via a nil result.
+func runHandler(handler Handler, query string) (string, error) {
+	if handler == nil {
+		return query, nil
+	}
+	out, err := handler(query)
+	if err != nil {
+		return "", fmt.Errorf("handler error: %w", err)
+	}
+	if out == nil {
+		return query, nil
+	}
+	return string(out), nil
+}
+
+// handleResponseConnection relays backend -> client messages. It decodes
+// each message (via pgproto3.Frontend) just enough to observe
+// Authentication requests (to unblock the request side's decoding of the
+// client's reply) and BackendKeyData (to support CancelRequest), then
+// forwards every message re-encoded verbatim.
+func (p *Proxy) handleResponseConnection(target backendTarget, authTypeCh chan<- uint32, pidRegistered *atomic.Uint32) {
+	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(p.rconn), p.rconn)
+
+	for {
+		msg, err := frontend.Receive()
+		if err != nil {
+			if err == io.EOF {
+				p.err("Backend closed connection", err)
+			} else {
+				p.err("Read from backend failed", err)
+			}
+			return
+		}
+
+		switch m := msg.(type) {
+		case *pgproto3.AuthenticationCleartextPassword:
+			authTypeCh <- pgproto3.AuthTypeCleartextPassword
+		case *pgproto3.AuthenticationMD5Password:
+			authTypeCh <- pgproto3.AuthTypeMD5Password
+		case *pgproto3.AuthenticationSASL:
+			authTypeCh <- pgproto3.AuthTypeSASL
+		case *pgproto3.AuthenticationSASLContinue:
+			authTypeCh <- pgproto3.AuthTypeSASLContinue
+		case *pgproto3.AuthenticationSASLFinal:
+			authTypeCh <- pgproto3.AuthTypeSASLFinal
+		case *pgproto3.BackendKeyData:
+			cancelRegistry.Store(m.ProcessID, backendSession{target: target, secretKey: m.SecretKey})
+			pidRegistered.Store(m.ProcessID + 1)
+		}
+
+		if _, err := p.lconn.Write(msg.Encode(nil)); err != nil {
+			p.err("Write to client failed", err)
 			return
 		}
 	}
-}
-
-// Proxy.handleResponseConnection forwards server responses to client
-func (p *Proxy) handleResponseConnection(src, dst net.Conn) {
-	// Server -> Client messages do not need to be parsed by this proxy.
-	// A simple io.Copy prevents deadlocks with 1-byte responses like SSLRequest's 'S' or 'N'.
-	_, err := io.Copy(dst, src)
-	if err != nil && err != io.EOF {
-		p.err("Server response error: %s\n", err)
-	}
-}
-
-// HandleQuery processes query content and applies the handler
-func HandleQuery(msgType byte, content []byte, requestHandler Handler) ([]byte, error) {
-	// Remove null terminator if present
-	queryStr := string(bytes.TrimSuffix(content, []byte{0}))
-
-	// Call handler with query string
-	data, err := requestHandler(queryStr)
-	if err != nil {
-		return nil, fmt.Errorf("handler error: %w", err)
-	}
-
-	// If handler returns data, use it
-	if data != nil {
-		// Ensure null terminator
-		if len(data) == 0 || data[len(data)-1] != 0 {
-			data = append(data, 0)
-		}
-		return data, nil
-	}
-
-	// Return original content with null terminator
-	if len(content) == 0 || content[len(content)-1] != 0 {
-		return append(content, 0), nil
-	}
-	return content, nil
 }
