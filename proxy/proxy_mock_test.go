@@ -658,8 +658,6 @@ func createMockQueryMessage(query string) []byte {
 	return encodeMsg(&pgproto3.Query{String: query})
 }
 
-
-
 // TestProxyWithPasswordChangeFilter tests that password changes are blocked
 func TestProxyWithPasswordChangeFilter(t *testing.T) {
 	mock, err := NewMockPgServer()
