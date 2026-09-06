@@ -135,14 +135,14 @@ hostile.
 
 - **NEVER construct or parse wire-protocol messages manually** via byte buffers
   (`binary.BigEndian`, `bytes.Buffer`, `io.ReadFull` framing). ALL protocol
-  interactions MUST use the pgproto3 library (`pgproto3.Frontend`,
-  `pgproto3.Backend`), currently `github.com/jackc/pgproto3/v2`
-  (`github.com/jackc/pgx/v5/pgproto3` is the maintained successor — see
-  REVIEW.md H3/H4 before adding new message handling).
+  interactions MUST use `github.com/jackc/pgx/v5/pgproto3` (`pgproto3.Frontend`,
+  `pgproto3.Backend`) — the codebase has fully migrated off the older
+  `jackc/pgproto3/v2`; do not reintroduce it.
 - Pass messages through by decode + re-encode; never modify binary payloads
   (Bind parameters, OIDs) in transit.
 - When adding handling for a new message type, add a mock-server test for it
-  (the mock currently covers only 'Q'/'X' — see REVIEW.md M10).
+  (`proxy/proxy_mock_test.go` already covers Query/Parse/Bind/Terminate and
+  the auth/cancel handshake — extend it rather than duplicating framing code).
 - Integration tests connect to localhost:5432 (user=postgres, password=testpass,
   dbname=testdb) and must skip when unavailable.
 
