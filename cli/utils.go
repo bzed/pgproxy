@@ -48,8 +48,8 @@ func readConfig(file string) (ProxyConfig, error) {
 		return pc, fmt.Errorf("failed to parse configuration file: %w", err)
 	}
 
-	if _, ok := pc.DB["master"]; !ok {
-		return pc, fmt.Errorf("configuration error: DB.master not found in configuration file")
+	if len(pc.DB) == 0 {
+		return pc, fmt.Errorf("configuration error: no databases configured under [DB.*] in configuration file")
 	}
 
 	return pc, nil

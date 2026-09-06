@@ -74,12 +74,20 @@ this, `[DB.*]` entries only need `Addr` and `DBName` - there is no `User`/
     allow_insert = true
     allow_update = true
     allow_delete = true
-    
+
     allow_truncate = false
     allow_alter_role = false
-    
+
+    # See "SET/RESET" and "EXECUTE" below.
+    allow_set_var = true
+    block_set_vars = ["session_authorization", "role"]
+    allow_execute = false
+
     require_where_for_update = true
     require_where_for_delete = true
+
+    # See "Statements the parser can't handle" below.
+    on_parse_error = "block"
 
     # block_signatures = ["SELECT * FROM users WHERE (id = _) AND (name = _)"]
     # allow_signatures = ["SELECT id FROM allowed_table"]
@@ -150,20 +158,52 @@ sudo systemctl enable --now pgproxy
 
 ## SQL Support
 
-pgproxy uses [postgresql-parser](https://github.com/auxten/postgresql-parser), a robust SQL parser extracted from CockroachDB. This provides comprehensive, native support for PostgreSQL syntax, data types, and keywords, making it far superior to legacy MySQL-based parsers.
+pgproxy uses [postgresql-parser](https://github.com/auxten/postgresql-parser), a SQL parser derived from
+CockroachDB's, to parse and classify `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER ROLE`, `SET`/`RESET`
+and `EXECUTE` statements for the per-statement-type filter rules below.
 
-Supports parsing and rewriting for a broad array of PostgreSQL statements including `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and many advanced SQL operations.
+**Known parser gaps**: this parser does not implement every PostgreSQL statement. `CREATE FUNCTION`,
+`COPY ... TO/FROM STDOUT/STDIN`, `LISTEN`/`NOTIFY`, `DELETE ... USING`, `GENERATED ALWAYS AS IDENTITY`, full-text
+`@@`, `MERGE`, `VACUUM`, `DO`, `CALL`, cursors, and `SET SESSION AUTHORIZATION <value>` (as opposed to `DEFAULT`)
+are all known to fail to parse today. What happens to a statement pgproxy can't parse is controlled by
+`on_parse_error` (see below) - by default such statements are simply refused, which also means pgproxy currently
+cannot proxy client sessions that need any of the syntax above.
 
-**Filter scope**: the per-statement-type rules (`allow_select`, `allow_insert`, ...) and the `require_where_for_*`
-rules only apply to `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` and `ALTER ROLE`. Any other statement type
-(`CREATE`, `DROP`, `GRANT`, `COPY`, `SET`, ...) is **allowed by default** unless it also matches
-`signature_filter_enabled`'s block/allow list. If you rely on pgproxy as a firewall against those statement types,
-use signature-based filtering (or restrict backend-side privileges) rather than the per-statement-type rules alone.
+**Nested mutations**: the per-statement-type rules apply to a mutation (`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`)
+wherever it appears in the statement, not just at the top level - inside a CTE, a `FROM`/`JOIN` subquery, a scalar
+or `EXISTS`/`IN` subquery, an `INSERT ... SELECT` source, an `UPDATE ... SET` expression, or a `CREATE TABLE AS`
+source, at any nesting depth. A data-modifying CTE hidden inside a subquery is not a way around `allow_delete`,
+`require_where_for_delete`, etc.
+
+**Filter scope**: the per-statement-type rules (`allow_select`, `allow_insert`, `allow_set_var`, `allow_execute`,
+...) and the `require_where_for_*` rules only apply to `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+`ALTER ROLE`, `SET`/`RESET` and `EXECUTE`. Any other statement type (`CREATE`, `DROP`, `GRANT`, `COPY`, ...) is
+**allowed by default** unless it also matches `signature_filter_enabled`'s block/allow list. If you rely on pgproxy
+as a firewall against those statement types, use signature-based filtering (or restrict backend-side privileges)
+rather than the per-statement-type rules alone.
+
+**SET/RESET**: `allow_set_var` defaults to `true`, since drivers and ORMs routinely send `SET` statements as part
+of connecting (pgjdbc's `SET extra_float_digits = 3`, ActiveRecord's `SET client_min_messages`, `SET TIME ZONE`,
+...) and refusing them by default would break most clients out of the box. `block_set_vars` (default
+`["session_authorization", "role"]`) is always enforced regardless of `allow_set_var`, since those two GUCs let a
+session change its own effective privileges mid-connection.
+
+**EXECUTE**: `allow_execute` defaults to `false`. pgproxy filters `Parse`'s query text, but by the time a later
+simple-protocol `EXECUTE name` (or extended-protocol `Execute` of a previously `Parse`d/`Bind`-bound statement)
+runs, the filter cannot re-inspect what that prepared statement actually does - so it is refused by default.
+
+**Statements the parser can't handle**: `on_parse_error` (default `"block"`) controls what happens when a
+statement fails to parse (see the known gaps above). `"allow"` forwards it to the backend **unfiltered - this
+bypasses every rule above for any statement matching a parser gap**, and should only be enabled if you understand
+and accept that. `"audit"` behaves like `"allow"` but first logs the statement text (with a best-effort redaction
+of `PASSWORD`/`IDENTIFIED BY` literals - not a guarantee against every way a secret could appear in a statement)
+so you can see what's being let through.
 
 **Signature filtering footgun**: if you set `signature_filter_enabled = true` and `signature_allow_by_default = false`
-without populating `allow_signatures`, pgproxy will block *every* statement (a blocked statement currently closes
-the client's connection with an error - see below). pgproxy logs a warning at startup when it detects this
-combination; treat it as a configuration error.
+without populating `allow_signatures`, pgproxy will block *every* statement. A blocked statement gets an
+`ErrorResponse` and the session keeps running (it does not disconnect the client), so "everything errors instead of
+working" is the visible symptom rather than constant disconnects. pgproxy logs a warning at startup when it detects
+this combination; treat it as a configuration error.
 
 ## Credits
 

@@ -302,6 +302,26 @@ func TestConnectBackend(t *testing.T) {
 		}
 	})
 
+	// TestConnectBackend/dial_timeout covers REVIEW.md M4: connectBackend
+	// must bound its dial with backendDialTimeout rather than blocking for
+	// the OS-level TCP connect timeout (which can be minutes) against a
+	// black-holed backend.
+	t.Run("dial timeout", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		old := backendDialTimeout
+		backendDialTimeout = time.Nanosecond
+		defer func() { backendDialTimeout = old }()
+
+		if _, _, err := connectBackend(DBConfig{Addr: ln.Addr().String()}, sm); err == nil {
+			t.Error("expected a dial timeout error")
+		}
+	})
+
 	t.Run("SSL upgrade succeeds and the rewritten StartupMessage is forwarded", func(t *testing.T) {
 		certPEM, keyPEM := generateSelfSignedCert(t, "backend.test")
 		cert, err := tls.X509KeyPair(certPEM, keyPEM)

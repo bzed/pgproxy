@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -244,6 +245,30 @@ func TestFilter_BypassPrevention(t *testing.T) {
 	}
 }
 
+// TestFilter_BypassPrevention_NestedSubqueries covers REVIEW.md C1: a
+// data-modifying CTE hidden inside a subquery (FROM, an INSERT source, a
+// scalar SET expression, or a CREATE TABLE AS source), not just at the
+// statement's own top level. All four must be blocked when AllowDelete is
+// false, exactly like a bare top-level DELETE would be.
+func TestFilter_BypassPrevention_NestedSubqueries(t *testing.T) {
+	config := DefaultFilterConfig()
+	config.AllowDelete = false
+
+	filter := NewQueryFilter(config)
+
+	queries := []string{
+		"SELECT * FROM (WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d) sub",
+		"INSERT INTO t SELECT * FROM (WITH d AS (DELETE FROM s RETURNING *) SELECT * FROM d) sub",
+		"UPDATE t SET x = (WITH d AS (DELETE FROM s RETURNING *) SELECT * FROM d)",
+		"CREATE TABLE c AS WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+	}
+	for _, q := range queries {
+		t.Run(q, func(t *testing.T) {
+			mustFilter(t, filter, q, false)
+		})
+	}
+}
+
 // TestFilter_ExecuteAndSetVar covers the AllowExecute/AllowSetVar switches.
 func TestFilter_ExecuteAndSetVar(t *testing.T) {
 	tests := []struct {
@@ -265,6 +290,72 @@ func TestFilter_ExecuteAndSetVar(t *testing.T) {
 			filter := NewQueryFilter(config)
 			mustFilter(t, filter, tt.query, tt.want)
 		})
+	}
+}
+
+// TestRedactSecrets covers REVIEW.md M9: PASSWORD/IDENTIFIED BY literals
+// must not appear verbatim in redacted output.
+func TestRedactSecrets(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{
+			"ALTER ROLE PASSWORD",
+			"ALTER ROLE bob WITH PASSWORD 'hunter2'",
+			"ALTER ROLE bob WITH PASSWORD '***REDACTED***'",
+		},
+		{
+			"CREATE USER IDENTIFIED BY",
+			"CREATE USER bob IDENTIFIED BY 'hunter2'",
+			"CREATE USER bob IDENTIFIED BY '***REDACTED***'",
+		},
+		{
+			"no secret clause is untouched",
+			"SELECT * FROM users WHERE name = 'bob'",
+			"SELECT * FROM users WHERE name = 'bob'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := redactSecrets(tt.query); got != tt.want {
+				t.Errorf("redactSecrets(%q) = %q, want %q", tt.query, got, tt.want)
+			}
+			if strings.Contains(redactSecrets(tt.query), "hunter2") {
+				t.Errorf("redactSecrets(%q) leaked the plaintext secret: %q", tt.query, redactSecrets(tt.query))
+			}
+		})
+	}
+}
+
+// TestFilter_DefaultAllowsCommonSetVar covers REVIEW.md M1: the default
+// config must allow the SET statements common drivers/ORMs send at connect
+// time (pgjdbc's extra_float_digits, ActiveRecord's client_min_messages,
+// SET TIME ZONE, ...), while still blocking the privilege-relevant GUCs via
+// BlockSetVars.
+func TestFilter_DefaultAllowsCommonSetVar(t *testing.T) {
+	filter := NewQueryFilter(DefaultFilterConfig())
+
+	allowed := []string{
+		"SET extra_float_digits = 3",
+		"SET client_min_messages = warning",
+		"SET TIME ZONE 'UTC'",
+		"SET application_name = 'myapp'",
+		"RESET ALL",
+	}
+	for _, q := range allowed {
+		t.Run(q, func(t *testing.T) { mustFilter(t, filter, q, true) })
+	}
+
+	blocked := []string{
+		"SET ROLE TO admin",
+		"SET role = 'admin'",
+		"SET session_authorization = 'admin'",
+		"SET session_authorization TO 'admin'",
+	}
+	for _, q := range blocked {
+		t.Run(q, func(t *testing.T) { mustFilter(t, filter, q, false) })
 	}
 }
 

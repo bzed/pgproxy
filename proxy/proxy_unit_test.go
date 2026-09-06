@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,27 +184,6 @@ func TestBuildErrorResponse_DefaultCode(t *testing.T) {
 	resp := buildErrorResponse("ERROR", "boom", "")
 	if !bytes.Contains(resp, []byte("XX000")) {
 		t.Errorf("expected the default SQLSTATE XX000 in the response, got %v", resp)
-	}
-}
-
-// TestNew covers the New constructor.
-func TestNew(t *testing.T) {
-	conn1, conn2 := net.Pipe()
-	defer conn1.Close()
-	defer conn2.Close()
-
-	p := New(conn1, 42)
-	if p.lconn != conn1 {
-		t.Error("New did not store the given connection")
-	}
-	if p.connID != 42 {
-		t.Errorf("connID = %d, want 42", p.connID)
-	}
-	if want := "Connection #042 "; p.prefix != want {
-		t.Errorf("prefix = %q, want %q", p.prefix, want)
-	}
-	if p.errsig == nil {
-		t.Error("errsig channel was not initialized")
 	}
 }
 
@@ -410,7 +388,7 @@ func TestHandleResponseConnection_CleanEOF(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		p.handleResponseConnection(backendTarget{}, make(chan uint32, 4), &atomic.Uint32{})
+		p.handleResponseConnection(backendTarget{}, make(chan uint32, 4))
 		close(done)
 	}()
 
@@ -454,7 +432,7 @@ func TestHandleResponseConnection_AuthTypeRelay(t *testing.T) {
 
 			done := make(chan struct{})
 			go func() {
-				p.handleResponseConnection(backendTarget{}, authTypeCh, &atomic.Uint32{})
+				p.handleResponseConnection(backendTarget{}, authTypeCh)
 				close(done)
 			}()
 

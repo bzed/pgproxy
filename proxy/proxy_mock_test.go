@@ -117,6 +117,7 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 	defer m.closeWg.Done()
 
 	isStartup := true
+	txStatus := byte('I') // tracks BEGIN/COMMIT/ROLLBACK so RFQ reports real state
 	for {
 		var msgType byte
 		var contentLength int
@@ -219,6 +220,13 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 				}
 			}
 
+			switch strings.ToUpper(strings.TrimSpace(query)) {
+			case "BEGIN":
+				txStatus = 'T'
+			case "COMMIT", "ROLLBACK":
+				txStatus = 'I'
+			}
+
 			// Send RowDescription: 1 field named "id", type int4 (OID 23),
 			// size 4, modifier -1, text format.
 			rdMsg := []byte{
@@ -253,11 +261,11 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 			}
 			conn.Write(ccMsg)
 
-			// Send ReadyForQuery
+			// Send ReadyForQuery, reporting the tracked transaction status.
 			rfqMsg := []byte{
 				'Z',        // ReadyForQuery
 				0, 0, 0, 5, // Length
-				'I', // Transaction status (Idle)
+				txStatus,
 			}
 			conn.Write(rfqMsg)
 
@@ -1100,5 +1108,229 @@ func TestProxyForwardsCancelRequest(t *testing.T) {
 	if got[0] != mock.backendPID || got[1] != mock.backendSecret {
 		t.Errorf("Backend received CancelRequest(%d, %d), want (%d, %d)",
 			got[0], got[1], mock.backendPID, mock.backendSecret)
+	}
+}
+
+// TestProxyStop_DrainsAndForceClosesSessions covers REVIEW.md M5: stop()
+// must not just close the listener and leave live sessions running forever.
+// A session sitting idle (no Terminate, nothing to make it exit on its own)
+// must be force-closed once the drain grace period elapses, and stop() must
+// return once that happens rather than hanging indefinitely.
+func TestProxyStop_DrainsAndForceClosesSessions(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Shorten the drain grace period so the test doesn't wait out the real
+	// production value.
+	oldDrainTimeout := drainTimeout
+	drainTimeout = 200 * time.Millisecond
+	defer func() { drainTimeout = oldDrainTimeout }()
+
+	proxyAddr := "127.0.0.1:29100"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	stop, err := Start(proxyAddr, dbs, handler)
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	// Open a session and leave it idle: no query, no Terminate, nothing
+	// that would make its goroutines exit on their own.
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	if err := performMockStartup(conn); err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop() did not return - idle session was not force-closed after the drain timeout")
+	}
+
+	// The client side must observe the connection actually closing.
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Error("expected the client connection to be closed by stop()'s force-close, got no error")
+	}
+}
+
+// TestProxyTeardown_DeletesCancelRegistryEntry covers REVIEW.md H1: session
+// teardown must delete exactly the cancelKey{pid,secret} this session
+// registered from BackendKeyData, not a re-derived/differently-typed key.
+// Before the fix, cancelRegistry.Delete(pid-1) was always a no-op against
+// the (pid, secret)-keyed map, so every session leaked one entry forever.
+func TestProxyTeardown_DeletesCancelRegistryEntry(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	proxyAddr := "127.0.0.1:29098"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	stop, err := Start(proxyAddr, dbs, handler)
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	if err := performMockStartup(conn); err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	key := cancelKey{pid: mock.backendPID, secret: [4]byte{byte(mock.backendSecret >> 24), byte(mock.backendSecret >> 16), byte(mock.backendSecret >> 8), byte(mock.backendSecret)}}
+
+	// Give the response-relaying goroutine time to observe BackendKeyData
+	// and register it, then confirm it's actually there before tearing
+	// down (otherwise a later "not found" would be meaningless).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := cancelRegistry.Load(key); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelRegistry never gained an entry for this session")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Close the client side to tear the session down and let cleanup run.
+	conn.Close()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := cancelRegistry.Load(key); !ok {
+			return // deleted, as expected
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelRegistry entry was not deleted on session teardown (H1 leak)")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestProxyBlockedQuery_PreservesTxStatus covers REVIEW.md H2: the synthetic
+// ReadyForQuery the proxy sends after a blocked query must echo the
+// backend's real transaction status, not hardcode 'I' (idle). A client
+// inside BEGIN...<blocked statement> is still in an open transaction on the
+// backend (which never saw the blocked statement), and must be told so.
+// This also covers part of M3: the session must keep serving queries after
+// a block, not just answer once and go silent.
+func TestProxyBlockedQuery_PreservesTxStatus(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Proxy handler that blocks DELETE, passes everything else through.
+	handler := func(query string) ([]byte, error) {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "DELETE") {
+			return nil, fmt.Errorf("DELETE not allowed")
+		}
+		return nil, nil
+	}
+
+	proxyAddr := "127.0.0.1:29099"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	stop, err := Start(proxyAddr, dbs, handler)
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	if err := performMockStartup(conn); err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	frontend := pgproto3.NewFrontend(conn, conn)
+	readRFQ := func(t *testing.T) *pgproto3.ReadyForQuery {
+		t.Helper()
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			msg, err := frontend.Receive()
+			if err != nil {
+				t.Fatalf("failed reading from proxy: %v", err)
+			}
+			if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				return rfq
+			}
+			if _, ok := msg.(*pgproto3.ErrorResponse); ok {
+				continue // the blocked query's error, RFQ follows
+			}
+		}
+	}
+
+	// BEGIN opens a real transaction on the backend.
+	if _, err := conn.Write(createMockQueryMessage("BEGIN")); err != nil {
+		t.Fatalf("failed to send BEGIN: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'T' {
+		t.Fatalf("after BEGIN: RFQ TxStatus = %q, want 'T'", rfq.TxStatus)
+	}
+
+	// The blocked DELETE never reaches the backend, but the client is
+	// still inside the transaction it opened above.
+	if _, err := conn.Write(createMockQueryMessage("DELETE FROM users")); err != nil {
+		t.Fatalf("failed to send blocked DELETE: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'T' {
+		t.Fatalf("after blocked DELETE: RFQ TxStatus = %q, want 'T' (backend transaction is still open)", rfq.TxStatus)
+	}
+
+	// The session must still be usable: a following SELECT gets a normal
+	// response (not a dropped connection).
+	if _, err := conn.Write(createMockQueryMessage("SELECT 1")); err != nil {
+		t.Fatalf("failed to send SELECT after blocked query: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'T' {
+		t.Fatalf("after SELECT: RFQ TxStatus = %q, want 'T'", rfq.TxStatus)
+	}
+
+	// COMMIT closes the transaction; TxStatus must go back to 'I'.
+	if _, err := conn.Write(createMockQueryMessage("COMMIT")); err != nil {
+		t.Fatalf("failed to send COMMIT: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'I' {
+		t.Fatalf("after COMMIT: RFQ TxStatus = %q, want 'I'", rfq.TxStatus)
 	}
 }

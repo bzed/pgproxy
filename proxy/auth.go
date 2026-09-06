@@ -141,7 +141,7 @@ func backendTLSConfig(db DBConfig, dialAddr string) (*tls.Config, error) {
 func connectBackend(db DBConfig, sm *pgproto3.StartupMessage) (net.Conn, backendTarget, error) {
 	target := targetFor(db.Addr)
 
-	conn, err := net.Dial(target.network, target.addr)
+	conn, err := net.DialTimeout(target.network, target.addr, backendDialTimeout)
 	if err != nil {
 		return nil, target, err
 	}

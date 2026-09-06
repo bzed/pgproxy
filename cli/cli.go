@@ -22,23 +22,37 @@ import (
 )
 
 // Main starts pgproxy using the TOML configuration at configPath. An empty
-// configPath falls back to the -config flag (default "pgproxy.conf"). Main
-// blocks until it receives SIGINT/SIGTERM, then shuts the proxy down
-// gracefully. It is a thin wrapper around run() that wires up the real
-// process-wide flag set and OS signal channel; run() carries the actual
-// startup/shutdown logic and is what tests exercise directly, since calling
-// Main more than once per test binary would panic on flag redefinition.
+// configPath falls back to the -config flag (default "pgproxy.conf"), unless
+// -version was given, in which case Main prints the version and returns
+// immediately. Otherwise Main blocks until it receives SIGINT/SIGTERM, then
+// shuts the proxy down gracefully. It is a thin wrapper around mainBody()
+// that wires up the real process-wide flag set and OS signal channel;
+// mainBody() (and run(), which it calls) carry the actual logic and are what
+// tests exercise directly, since calling Main more than once per test binary
+// would panic on flag redefinition.
 func Main(configPath string) {
 	proxyconf := flag.String("config", "pgproxy.conf", "configuration file for pgproxy")
+	showVersion := flag.Bool("version", false, "print the pgproxy version and exit")
 	flag.Parse()
 	defer glog.Flush()
 
-	if configPath == "" {
-		configPath = *proxyconf
-	}
-
 	chExit := make(chan os.Signal, 1)
 	signal.Notify(chExit, syscall.SIGINT, syscall.SIGTERM)
+	mainBody(configPath, *proxyconf, *showVersion, chExit)
+}
+
+// mainBody is Main's actual logic, taking the parsed flag values as plain
+// arguments so it - unlike Main itself - can be unit-tested repeatedly
+// without touching global flag.CommandLine state.
+func mainBody(configPath, proxyconf string, showVersion bool, chExit <-chan os.Signal) {
+	if showVersion {
+		fmt.Println(VERSION)
+		return
+	}
+
+	if configPath == "" {
+		configPath = proxyconf
+	}
 	run(configPath, chExit)
 }
 

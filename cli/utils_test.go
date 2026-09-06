@@ -62,7 +62,11 @@ func Test_readConfig_malformedTOML(t *testing.T) {
 	}
 }
 
-func Test_readConfig_missingMaster(t *testing.T) {
+// Test_readConfig_noMasterRequired covers L2: readConfig must accept a
+// config whose only [DB.*] entry is not named "master" - the name "master"
+// was never documented and is not special to pgproxy (the client's
+// requested database name just needs to match some [DB.*] key).
+func Test_readConfig_noMasterRequired(t *testing.T) {
 	testConfig := `
 [ServerConfig]
     ProxyAddr = "127.0.0.1:9090"
@@ -77,7 +81,29 @@ func Test_readConfig_missingMaster(t *testing.T) {
 		t.Fatalf("Failed to create test config: %v", err)
 	}
 
+	pc, err := readConfig(configPath)
+	if err != nil {
+		t.Fatalf("readConfig() error = %v, want nil for a config with only DB.reports", err)
+	}
+	if _, ok := pc.DB["reports"]; !ok {
+		t.Error("Expected DB.reports to exist")
+	}
+}
+
+// Test_readConfig_noDatabasesConfigured covers the actual, documented
+// requirement: at least one [DB.*] entry, under any name.
+func Test_readConfig_noDatabasesConfigured(t *testing.T) {
+	testConfig := `
+[ServerConfig]
+    ProxyAddr = "127.0.0.1:9090"
+`
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test.conf")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0644); err != nil {
+		t.Fatalf("Failed to create test config: %v", err)
+	}
+
 	if _, err := readConfig(configPath); err == nil {
-		t.Error("Expected an error when DB.master is missing, got nil")
+		t.Error("Expected an error when no [DB.*] entries are configured, got nil")
 	}
 }
