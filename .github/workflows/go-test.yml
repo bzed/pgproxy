@@ -175,6 +175,29 @@ jobs:
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
 
+  windows-cross-build:
+    name: Windows Cross-Compile Check
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+
+    - name: Install mingw-w64 (needed for cgo cross-compile, see AGENTS.md "Cgo dependency")
+      run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64-posix
+
+    - name: Cross-compile for windows/amd64
+      env:
+        GOOS: windows
+        GOARCH: amd64
+        CGO_ENABLED: 1
+        CC: x86_64-w64-mingw32-gcc
+      run: go build -v -o /tmp/pgproxy.exe .
+
   lint:
     name: Lint and Format Check
     runs-on: ubuntu-latest

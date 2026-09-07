@@ -10,16 +10,18 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
-	pgparser "github.com/auxten/postgresql-parser/pkg/sql/parser"
-	"github.com/auxten/postgresql-parser/pkg/sql/sem/tree"
 	"github.com/golang/glog"
+	pgquery "github.com/pganalyze/pg_query_go/v6"
 )
 
 // passwordLiteralRe matches a quoted string literal immediately following
 // PASSWORD or IDENTIFIED BY (case-insensitive), e.g. the secret in
 // `ALTER ROLE bob WITH PASSWORD 'hunter2'` or
-// `CREATE USER bob IDENTIFIED BY 'hunter2'`. Used by redactSecrets below.
+// `CREATE USER bob IDENTIFIED BY 'hunter2'`. Used by redactSecrets below,
+// as the fallback for the (now rare - see OnParseError's doc comment)
+// statement that fails to parse at all, so there is no AST to Normalize.
 //
 // This is a best-effort textual redaction, not a full-grammar one: it
 // cannot recognize a secret spread across dollar-quoting, string
@@ -55,15 +57,31 @@ type FilterConfig struct {
 	// AllowSetVar is true - because setting them mid-session lets a
 	// client re-authenticate as another role or otherwise change its
 	// effective privileges (see REVIEW.md M1). Matched case-insensitively
-	// against the SET statement's variable name. Defaults to
+	// against the SET/RESET statement's variable name. Defaults to
 	// {"session_authorization", "role"}; only takes effect when
 	// AllowSetVar is true (AllowSetVar=false already blocks every SET).
 	BlockSetVars []string `toml:"block_set_vars"`
 
-	SignatureFilterEnabled  bool   `toml:"signature_filter_enabled"`
-	SignatureAllowByDefault bool   `toml:"signature_allow_by_default"`
-	SignatureAuditMode      bool   `toml:"signature_audit_mode"`
-	OnParseError            string `toml:"on_parse_error"`
+	// SignatureFilterEnabled and friends match against the statement
+	// normalized by the real PostgreSQL parser (constants replaced with
+	// $1, $2, ... placeholders - see pg_query.Normalize), NOT the
+	// dialect-specific "(col = _)" style produced by pgproxy's previous,
+	// CockroachDB-derived parser. Signatures configured before the C2 fix
+	// (REVIEW.md) must be rewritten to match.
+	SignatureFilterEnabled  bool `toml:"signature_filter_enabled"`
+	SignatureAllowByDefault bool `toml:"signature_allow_by_default"`
+	SignatureAuditMode      bool `toml:"signature_audit_mode"`
+
+	// OnParseError controls what happens to a statement the parser cannot
+	// parse at all: "block" (default), "allow", or "audit". Since the C2
+	// fix this uses the real PostgreSQL grammar (github.com/pganalyze/
+	// pg_query_go, a cgo binding of libpg_query - the actual PostgreSQL
+	// parser), so this path should now be rare in practice: syntax that
+	// PostgreSQL itself accepts, pgproxy now parses too. It still exists
+	// for genuinely malformed input and for syntax newer than the
+	// bundled libpg_query version. See the Filter doc comment for the
+	// "allow"/"audit" bypass implications, unchanged from before.
+	OnParseError string `toml:"on_parse_error"`
 
 	BlockSignatures []string `toml:"block_signatures"`
 	AllowSignatures []string `toml:"allow_signatures"`
@@ -95,15 +113,31 @@ func DefaultFilterConfig() FilterConfig {
 	}
 }
 
-// QueryFilter applies FilterConfig rules to SQL statements.
+// QueryFilter applies FilterConfig rules to SQL statements. Safe for
+// concurrent use, including concurrent calls to UpdateConfig (REVIEW.md M8):
+// config is stored behind an atomic.Pointer rather than a plain field so a
+// config swap is never observed as a torn/partial update by a Filter call
+// running on another goroutine.
 type QueryFilter struct {
-	config FilterConfig
+	config atomic.Pointer[FilterConfig]
 }
 
 // NewQueryFilter creates a new QueryFilter with the given configuration.
 func NewQueryFilter(config FilterConfig) *QueryFilter {
 	WarnIfFilterConfigIsUnsafe(config, glog.Warningf)
-	return &QueryFilter{config: config}
+	f := &QueryFilter{}
+	f.config.Store(&config)
+	return f
+}
+
+// UpdateConfig atomically replaces the filter's configuration, so an
+// operator can change filter rules without restarting the process
+// (REVIEW.md M8, e.g. on SIGHUP - see cli.run). Takes effect for every
+// Filter call that starts after this returns; a call already in progress
+// finishes with whichever config it already loaded.
+func (f *QueryFilter) UpdateConfig(config FilterConfig) {
+	WarnIfFilterConfigIsUnsafe(config, glog.Warningf)
+	f.config.Store(&config)
 }
 
 // WarnIfFilterConfigIsUnsafe logs a loud warning (via warnf, e.g.
@@ -121,40 +155,42 @@ func WarnIfFilterConfigIsUnsafe(config FilterConfig, warnf func(format string, a
 	}
 }
 
-// Filter checks if the SQL statement meets the configured criteria.
-// Returns true if the query is safe and should be allowed.
-
-// extractStatements returns stmt plus every tree.Statement reachable from it
-// by generic reflection over exported fields, slices and interfaces: CTEs
-// (top-level and nested arbitrarily deep), subqueries anywhere a Select can
-// appear (FROM, JOIN, scalar/EXISTS/IN expressions, INSERT sources, UPDATE
-// SET expressions, CREATE TABLE AS), and EXPLAIN/PREPARE bodies. Walking the
-// AST generically - rather than hand-listing every statement/expression
-// field that might hold a nested statement - means a bypass shape the
-// switch below doesn't special-case still gets classified, because the
-// walk finds the nested Insert/Update/Delete/Truncate node regardless of
-// where it is embedded (see REVIEW.md C1).
+// extractStatements returns every pg_query node under root whose concrete
+// type is one this filter has a rule for (*pgquery.SelectStmt,
+// *pgquery.InsertStmt, ...), found by a generic reflection walk over
+// exported fields, slices, interfaces and the protobuf oneof wrapper
+// (pgquery.Node.Node) - so it doesn't matter whether the node sits at the
+// statement's own top level, inside a CTE (at any depth), a FROM/JOIN
+// subquery, a scalar/EXISTS subquery, an INSERT...SELECT source, an
+// UPDATE...SET expression, a CREATE TABLE AS source, or an EXPLAIN/PREPARE
+// body: the walk finds it regardless of where it is embedded (see
+// REVIEW.md C1). Walking generically, rather than hand-listing every
+// statement/expression field that might hold a nested statement, also
+// means a shape this doc comment doesn't anticipate still gets found.
 //
 // A pointer's identity is tracked in seen to avoid re-visiting shared nodes
 // (harmless for an AST, which is a tree, but cheap insurance against
-// accidental sharing or future library changes) and to bound the walk.
-func extractStatements(root tree.Statement) []tree.Statement {
-	out := []tree.Statement{root}
+// accidental sharing) and to bound the walk.
+func extractStatements(root *pgquery.Node) []any {
+	var out []any
 	seen := make(map[uintptr]bool)
-	v := reflect.ValueOf(root)
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return out
-		}
-		seen[v.Pointer()] = true
-		walkStatementTree(v.Elem(), seen, &out)
-	} else {
-		walkStatementTree(v, seen, &out)
-	}
+	walkNodeTree(reflect.ValueOf(root), seen, &out)
 	return out
 }
 
-func walkStatementTree(v reflect.Value, seen map[uintptr]bool, out *[]tree.Statement) {
+// filteredStmtTypes are the concrete pg_query node types extractStatements
+// collects - exactly the types Filter's switch below has a case for.
+func isFilteredStmtType(v any) bool {
+	switch v.(type) {
+	case *pgquery.SelectStmt, *pgquery.InsertStmt, *pgquery.UpdateStmt, *pgquery.DeleteStmt,
+		*pgquery.TruncateStmt, *pgquery.AlterRoleStmt, *pgquery.VariableSetStmt, *pgquery.ExecuteStmt:
+		return true
+	default:
+		return false
+	}
+}
+
+func walkNodeTree(v reflect.Value, seen map[uintptr]bool, out *[]any) {
 	if !v.IsValid() {
 		return
 	}
@@ -163,7 +199,7 @@ func walkStatementTree(v reflect.Value, seen map[uintptr]bool, out *[]tree.State
 		if v.IsNil() {
 			return
 		}
-		walkStatementTree(v.Elem(), seen, out)
+		walkNodeTree(v.Elem(), seen, out)
 	case reflect.Ptr:
 		if v.IsNil() {
 			return
@@ -173,82 +209,106 @@ func walkStatementTree(v reflect.Value, seen map[uintptr]bool, out *[]tree.State
 			return
 		}
 		seen[ptr] = true
-		if stmt, ok := v.Interface().(tree.Statement); ok {
-			*out = append(*out, stmt)
+		if iface := v.Interface(); isFilteredStmtType(iface) {
+			*out = append(*out, iface)
 		}
-		walkStatementTree(v.Elem(), seen, out)
+		walkNodeTree(v.Elem(), seen, out)
 	case reflect.Struct:
 		t := v.Type()
 		for i := 0; i < v.NumField(); i++ {
 			if t.Field(i).PkgPath != "" {
-				continue // unexported field
+				continue // unexported field (protobuf internals: state, sizeCache, ...)
 			}
-			walkStatementTree(v.Field(i), seen, out)
+			walkNodeTree(v.Field(i), seen, out)
 		}
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < v.Len(); i++ {
-			walkStatementTree(v.Index(i), seen, out)
+			walkNodeTree(v.Index(i), seen, out)
 		}
 	case reflect.Map:
 		for _, k := range v.MapKeys() {
-			walkStatementTree(v.MapIndex(k), seen, out)
+			walkNodeTree(v.MapIndex(k), seen, out)
 		}
 	}
 }
 
+// stmtText returns the exact source text of a single top-level statement
+// out of the (possibly multi-statement) raw query string, using the
+// location/length the parser reported for it. A reported length of 0 means
+// "to the end of the string" (the convention libpg_query uses for the last
+// statement).
+func stmtText(query string, raw *pgquery.RawStmt) string {
+	loc := int(raw.StmtLocation)
+	if loc < 0 || loc > len(query) {
+		return query
+	}
+	length := int(raw.StmtLen)
+	if length <= 0 || loc+length > len(query) {
+		return strings.TrimSpace(query[loc:])
+	}
+	return strings.TrimSpace(query[loc : loc+length])
+}
+
+// Filter checks if the SQL statement meets the configured criteria.
+// Returns true if the query is safe and should be allowed.
 func (f *QueryFilter) Filter(str []byte) bool {
-	stmts, err := pgparser.Parse(string(str))
+	// Load once: a config swapped in mid-call (via UpdateConfig, e.g. on
+	// SIGHUP - REVIEW.md M8) must not be applied inconsistently within a
+	// single Filter call.
+	cfg := *f.config.Load()
+
+	query := string(str)
+	result, err := pgquery.Parse(query)
 	if err != nil {
 		glog.Errorf("Parse error: %v", err)
-		if f.config.OnParseError == "allow" || f.config.OnParseError == "audit" {
-			if f.config.OnParseError == "audit" {
-				// Unlike SIGNATURE_AUDIT below (which logs a
-				// constants-hidden signature), a query that failed to
-				// parse has no AST to redact via FmtHideConstants, so the
-				// raw text is logged - best-effort redact PASSWORD/
+		if cfg.OnParseError == "allow" || cfg.OnParseError == "audit" {
+			if cfg.OnParseError == "audit" {
+				// A query that failed to parse has no AST to Normalize, so
+				// the raw text is logged - best-effort redact PASSWORD/
 				// IDENTIFIED BY literals first (M9).
-				glog.Warningf("AUDIT (Parse Error): %s", redactSecrets(string(str)))
+				glog.Warningf("AUDIT (Parse Error): %s", redactSecrets(query))
 			}
 			return true
 		}
 		return false
 	}
 
-	for _, stmt := range stmts {
-		// Signature-based filtering
-		sig := tree.AsStringWithFlags(stmt.AST, tree.FmtHideConstants)
+	for _, raw := range result.Stmts {
+		if cfg.SignatureFilterEnabled {
+			sig, sigErr := pgquery.Normalize(stmtText(query, raw))
+			if sigErr != nil {
+				// Normalize can fail even though the full-query Parse above
+				// succeeded (e.g. a utility statement Normalize doesn't
+				// support). Fail closed on the signature check rather than
+				// silently skipping it.
+				glog.Errorf("Normalize error: %v", sigErr)
+				return false
+			}
+			sig = strings.TrimSpace(sig)
 
-		if f.config.SignatureFilterEnabled {
 			blocked := false
-
-			// Check block signatures first
-			for _, b := range f.config.BlockSignatures {
+			for _, b := range cfg.BlockSignatures {
 				if sig == b {
 					blocked = true
 					break
 				}
 			}
 
-			// If not blocked by blocklist, check allow logic
 			if !blocked {
 				allowed := false
-				for _, a := range f.config.AllowSignatures {
+				for _, a := range cfg.AllowSignatures {
 					if sig == a {
 						allowed = true
 						break
 					}
 				}
-
-				if !allowed {
-					// If it wasn't explicitly allowed, fallback to default behavior
-					if !f.config.SignatureAllowByDefault {
-						blocked = true
-					}
+				if !allowed && !cfg.SignatureAllowByDefault {
+					blocked = true
 				}
 			}
 
 			if blocked {
-				if f.config.SignatureAuditMode {
+				if cfg.SignatureAuditMode {
 					glog.Infof("SIGNATURE_AUDIT: %q", sig)
 				} else {
 					return false
@@ -256,54 +316,51 @@ func (f *QueryFilter) Filter(str []byte) bool {
 			}
 		}
 
-		for _, ast := range extractStatements(stmt.AST) {
-			switch ast := ast.(type) {
-			case *tree.Select:
-				if !f.config.AllowSelect {
+		for _, node := range extractStatements(raw.Stmt) {
+			switch n := node.(type) {
+			case *pgquery.SelectStmt:
+				if !cfg.AllowSelect {
 					return false
 				}
-			case *tree.Delete:
-				if !f.config.AllowDelete {
+			case *pgquery.DeleteStmt:
+				if !cfg.AllowDelete {
 					return false
 				}
-				if f.config.RequireWhereForDelete && ast.Where == nil {
+				if cfg.RequireWhereForDelete && n.WhereClause == nil {
 					return false
 				}
-			case *tree.Update:
-				if !f.config.AllowUpdate {
+			case *pgquery.UpdateStmt:
+				if !cfg.AllowUpdate {
 					return false
 				}
-				if f.config.RequireWhereForUpdate && ast.Where == nil {
+				if cfg.RequireWhereForUpdate && n.WhereClause == nil {
 					return false
 				}
-			case *tree.Insert:
-				if !f.config.AllowInsert {
+			case *pgquery.InsertStmt:
+				if !cfg.AllowInsert {
 					return false
 				}
-			case *tree.Truncate:
-				if !f.config.AllowTruncate {
+			case *pgquery.TruncateStmt:
+				if !cfg.AllowTruncate {
 					return false
 				}
-
-			case *tree.AlterRole:
-				if !f.config.AllowAlterRole {
+			case *pgquery.AlterRoleStmt:
+				if !cfg.AllowAlterRole {
 					return false
 				}
-			case *tree.SetVar:
-				if !f.config.AllowSetVar {
+			case *pgquery.VariableSetStmt:
+				if !cfg.AllowSetVar {
 					return false
 				}
-				for _, blocked := range f.config.BlockSetVars {
-					if strings.EqualFold(ast.Name, blocked) {
+				for _, blocked := range cfg.BlockSetVars {
+					if strings.EqualFold(n.Name, blocked) {
 						return false
 					}
 				}
-			case *tree.Execute:
-				if !f.config.AllowExecute {
+			case *pgquery.ExecuteStmt:
+				if !cfg.AllowExecute {
 					return false
 				}
-			default:
-				glog.V(2).Infof("Allowing %T by default", ast)
 			}
 		}
 	}

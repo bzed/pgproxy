@@ -7,6 +7,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -67,8 +68,31 @@ var drainTimeout = 5 * time.Second
 // running past that (REVIEW.md M5 - stop() used to only close the listener,
 // leaving every live session's goroutines and backend connection running
 // forever).
-func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) (stop func(), err error) {
+//
+// opts configures optional behavior - see WithTLS, WithACL,
+// WithContextHandler, WithMaxConnections, and WithIdleTimeout. With no
+// options, Start's behavior is unchanged from before Options existed.
+func Start(proxyHost string, dbs map[string]DBConfig, handler Handler, opts ...Option) (stop func(), err error) {
 	glog.Infof("Proxying from %v with %d configured databases\n", proxyHost, len(dbs))
+
+	var cfg startConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	compiledACL, err := compileACL(cfg.acl)
+	if err != nil {
+		return nil, err
+	}
+	// Always have a real Metrics here, even if the caller didn't ask to
+	// observe one via WithMetrics: WithMaxConnections' check depends on
+	// ActiveConnections being tracked regardless (a nil *Metrics' counters
+	// are nil-safe no-ops/zero via metrics.go's addXxx/
+	// loadActiveConnections, which would otherwise make the connection
+	// cap unenforceable).
+	metrics := cfg.metrics
+	if metrics == nil {
+		metrics = &Metrics{}
+	}
 
 	listener, err := getListener(proxyHost)
 	if err != nil {
@@ -102,19 +126,46 @@ func Start(proxyHost string, dbs map[string]DBConfig, handler Handler) (stop fun
 				}
 			}
 			id := atomic.AddUint64(&connid, 1)
+			prefix := fmt.Sprintf("Connection #%03d ", id)
+			metrics.addTotalConnections(1)
+
+			if err := compiledACL.checkAddr(conn.RemoteAddr()); err != nil {
+				glog.Warningf("%sRejected by ACL: %v", prefix, err)
+				metrics.addRejectedByACL(1)
+				// Best-effort: the caller is closing the connection right
+				// after regardless of whether this write succeeds.
+				_, _ = conn.Write(buildErrorResponse("FATAL", "connection not permitted", "28000"))
+				conn.Close()
+				continue
+			}
+
+			if cfg.maxConnections > 0 && metrics.loadActiveConnections() >= int64(cfg.maxConnections) {
+				glog.Warningf("%sRejected: at the %d-connection limit", prefix, cfg.maxConnections)
+				metrics.addRejectedByMaxConnections(1)
+				_, _ = conn.Write(buildErrorResponse("FATAL", "too many connections", "53300")) // best-effort, see above
+				conn.Close()
+				continue
+			}
 
 			p := &Proxy{
-				lconn:  conn,
-				errsig: make(chan struct{}),
-				prefix: fmt.Sprintf("Connection #%03d ", id),
-				connID: id,
+				lconn:          conn,
+				errsig:         make(chan struct{}),
+				prefix:         prefix,
+				connID:         id,
+				tlsConfig:      cfg.tlsConfig,
+				acl:            compiledACL,
+				contextHandler: cfg.contextHandler,
+				idleTimeout:    cfg.idleTimeout,
+				metrics:        metrics,
 			}
 			p.lastTxStatus.Store(uint32('I'))
 
 			sessions.Store(id, p)
+			metrics.addActiveConnections(1)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				defer metrics.addActiveConnections(-1)
 				defer sessions.Delete(id)
 				p.service(dbs, handler)
 			}()
@@ -258,6 +309,34 @@ type Proxy struct {
 	// exactly that entry instead of a re-derived, possibly differently
 	// typed key (REVIEW.md H1).
 	registeredKey atomic.Pointer[cancelKey]
+
+	// tlsConfig, if non-nil, terminates TLS on this session's client
+	// connection when it sends an SSLRequest (REVIEW.md H3, set via
+	// WithTLS). Read-only after construction.
+	tlsConfig *tls.Config
+
+	// acl, if non-nil, is checked against this session's user and
+	// requested database in serviceStartup (REVIEW.md H4, set via
+	// WithACL; the source-address half of the check already ran at
+	// accept time in Start). Read-only after construction.
+	acl *compiledACL
+
+	// contextHandler, if non-nil, is used instead of service's plain
+	// Handler argument (REVIEW.md M7, set via WithContextHandler).
+	// Read-only after construction.
+	contextHandler ContextHandler
+
+	// idleTimeout, if positive, bounds how long the client connection may
+	// go without a complete incoming message before being closed
+	// (REVIEW.md M4, set via WithIdleTimeout). Read-only after
+	// construction.
+	idleTimeout time.Duration
+
+	// metrics collects this session's contribution to the process-wide
+	// counters (REVIEW.md M8, set via WithMetrics or defaulted internally
+	// by Start). Never nil; safe for concurrent use by design (see
+	// Metrics' doc comment). Read-only after construction.
+	metrics *Metrics
 }
 
 // err records the first error for this connection and unblocks service().
@@ -301,9 +380,14 @@ func buildErrorResponse(severity, message string, code string) []byte {
 
 // Proxy.service open connection to remote and service proxying data.
 func (p *Proxy) service(dbs map[string]DBConfig, handler Handler) {
-	defer p.lconn.Close()
+	// A closure, not `defer p.lconn.Close()`: readStartupMessage may
+	// replace p.lconn with a TLS-wrapped connection (H3) below, and a bare
+	// `defer p.lconn.Close()` would capture the pre-TLS conn at defer-time
+	// instead of whatever p.lconn ends up being.
+	defer func() { p.lconn.Close() }()
 
-	msg, err := readStartupMessage(p.lconn)
+	msg, conn, err := readStartupMessage(p.lconn, p.tlsConfig)
+	p.lconn = conn
 	if err != nil {
 		p.err("Failed to read startup message", err)
 		return
@@ -349,6 +433,19 @@ func (p *Proxy) forwardCancelRequest(cr *pgproto3.CancelRequest) {
 
 func (p *Proxy) serviceStartup(sm *pgproto3.StartupMessage, dbs map[string]DBConfig, handler Handler) {
 	dbName := sm.Parameters["database"]
+	user := sm.Parameters["user"]
+
+	if err := p.acl.checkDatabase(dbName); err != nil {
+		p.writeError("FATAL", "database not permitted", "42501")
+		p.err("Rejected by ACL: "+err.Error(), nil)
+		return
+	}
+	if err := p.acl.checkUser(user); err != nil {
+		p.writeError("FATAL", "user not permitted", "42501")
+		p.err("Rejected by ACL: "+err.Error(), nil)
+		return
+	}
+
 	dbConf, ok := dbs[dbName]
 	if !ok {
 		p.writeError("FATAL", "database not found in proxy config: "+dbName, "3D000")
@@ -358,6 +455,7 @@ func (p *Proxy) serviceStartup(sm *pgproto3.StartupMessage, dbs map[string]DBCon
 
 	rconn, target, err := connectBackend(dbConf, sm)
 	if err != nil {
+		p.metrics.addBackendConnectErrors(1)
 		p.writeError("FATAL", "backend connection failed: "+err.Error(), "08006")
 		p.err("Remote connection failed", err)
 		return
@@ -374,7 +472,23 @@ func (p *Proxy) serviceStartup(sm *pgproto3.StartupMessage, dbs map[string]DBCon
 	// protocol ordering would be a data race.
 	authTypeCh := make(chan uint32, 4)
 
-	go p.handleIncomingConnection(handler, authTypeCh)
+	// A ContextHandler (M7), if configured, takes priority over the plain
+	// Handler and gets this session's identity - built once, here, since
+	// this is the first point every field it needs (dbName, user, the
+	// client's address) is available.
+	effectiveHandler := handler
+	if p.contextHandler != nil {
+		info := ConnInfo{
+			ConnID:     p.connID,
+			User:       user,
+			Database:   dbName,
+			RemoteAddr: p.lconn.RemoteAddr().String(),
+		}
+		ctxHandler := p.contextHandler
+		effectiveHandler = func(query string) ([]byte, error) { return ctxHandler(info, query) }
+	}
+
+	go p.handleIncomingConnection(effectiveHandler, authTypeCh)
 	go p.handleResponseConnection(target, authTypeCh)
 
 	// wait for close...
@@ -410,10 +524,20 @@ func (p *Proxy) handleIncomingConnection(handler Handler, authTypeCh <-chan uint
 			}
 		}
 
+		// WithIdleTimeout (M4): reset the read deadline before every
+		// message, not just once, so an active session isn't cut off mid-
+		// stream - only a gap between messages longer than idleTimeout
+		// closes the connection.
+		if p.idleTimeout > 0 {
+			_ = p.lconn.SetReadDeadline(time.Now().Add(p.idleTimeout))
+		}
+
 		msg, err := backend.Receive()
 		if err != nil {
 			if err == io.EOF {
 				p.err("Client closed connection", err)
+			} else if ne, ok := err.(net.Error); ok && ne.Timeout() && p.idleTimeout > 0 {
+				p.err(fmt.Sprintf("Client idle for longer than %s", p.idleTimeout), nil)
 			} else {
 				p.err("Read from client failed", err)
 			}
@@ -422,6 +546,7 @@ func (p *Proxy) handleIncomingConnection(handler Handler, authTypeCh <-chan uint
 
 		out, herr := p.applyFrontendHandler(msg, handler)
 		if herr != nil {
+			p.metrics.addBlockedQueries(1)
 			p.writeError("ERROR", herr.Error(), "42501")
 			// Keep session alive for blocked queries (H1) and report the
 			// backend's actual transaction status rather than hardcoding

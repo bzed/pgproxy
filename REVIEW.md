@@ -1,181 +1,75 @@
-# pgproxy Code Review — 4th pass
+# pgproxy Code Review — 5th pass
 
-Date: 2026-09-06
-Scope: fix or refute every finding from the 3rd-pass review below
-(`7cc0e17`..working tree). This pass focuses on the Critical/High items plus
-as many Medium/Low items as could be fixed with a real, tested change rather
-than a config knob or a promise. Every "fixed" row below has a regression
-test backing it, not just a code change.
+Date: 2026-09-07
+Scope: fix every item the 4th-pass review left open (C2, H3, H4, M7, M8, and
+the remainder of M3/M4). Every "fixed" row below has a regression test
+backing it, not just a code change, and every claim about build/test status
+was re-verified in this pass, not carried over from memory.
 
 ## How findings were verified
 
-- `go build ./...` — OK; `GOOS=windows GOARCH=amd64 go build ./...` — OK
+- `go build ./...` — OK
+- `GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build ./...` — OK
+  (see C2: this now needs a mingw-w64 cross compiler; verified by actually
+  installing one - `gcc-mingw-w64-x86-64-posix` extracted without root into a
+  local prefix - and cross-compiling, not just reasoning about it)
 - `go vet ./...` — OK
 - `golangci-lint run --config .golangci.yml ./...` — OK (exit 0)
 - `gofmt -l .` — no output (clean)
-- `go test -race -count=1 ./...` — OK, all packages pass
-- Per-package coverage: `.` (main) 100%, cli 89.8%, parser 93.9%,
-  proxy 89.9% — 85% gate met everywhere
-- Every fix below has a dedicated regression test that fails against the old
-  code and passes against the new code (verified by running each new test
-  before/after the corresponding change during this pass, not just after).
+- `go test -race -count=1 ./...` — OK, all packages pass, re-run 3x to check
+  for flakiness (one genuine flake was found and fixed - see M8 row/notes)
+- Per-package coverage: main 100%, cli 91.1%, parser 91.0%, proxy 92.9% — 85%
+  gate met everywhere
 
-### Status of the 3rd-pass findings
+### Status of the 4th-pass findings
 
 | Old ID | Status | Notes |
 |---|---|---|
-| C1 (nested CTE/subquery bypass) | **fixed** | `extractStatements` rewritten as a generic reflection walk over the whole AST (`parser/filter.go`) instead of a hand-maintained switch; catches a mutation in a CTE, `FROM`/`JOIN` subquery, scalar/`EXISTS` subquery, `INSERT...SELECT` source, `UPDATE...SET` expression, or `CREATE TABLE AS` source, at any depth. `TestFilter_BypassPrevention_NestedSubqueries` covers all four queries from the 3rd-pass report. |
-| C2 (parser is CockroachDB's grammar, `on_parse_error=allow` bypass) | **still open** | Parser was not replaced (see Critical below) — this is the one finding this pass leaves substantively open, deliberately: swapping the parsing engine is a large, high-risk change that deserves its own pass rather than being rushed alongside everything else here. `on_parse_error`, `allow_set_var`, `allow_execute`, `block_set_vars` are now fully documented in README.md and pgproxy.conf (closes the docs half of C2/M2), and the audit-mode log line now redacts `PASSWORD`/`IDENTIFIED BY` literals (M9). |
-| H1 (cancel registry leak) | **fixed** | Session now tracks the exact `cancelKey{pid,secret}` it registered (`Proxy.registeredKey`) and deletes that same key on teardown, instead of a re-derived, differently-typed key that was always a no-op. `TestProxyTeardown_DeletesCancelRegistryEntry` fails against the old code (confirmed: old code's `cancelRegistry.Delete(pid-1)` is a type-mismatched no-op) and passes now. |
-| H2 (blocked-query ReadyForQuery hardcodes TxStatus='I') | **fixed** | The response-relaying goroutine now records the backend's last real `ReadyForQuery.TxStatus` (`Proxy.lastTxStatus`) and the synthetic RFQ sent after a blocked query echoes it. `TestProxyBlockedQuery_PreservesTxStatus` drives `BEGIN` → blocked `DELETE` → asserts `TxStatus='T'` → `SELECT` (session still serves queries) → `COMMIT` → asserts `TxStatus='I'`. |
-| H3 (frontend TLS) | **still open** | Not attempted this pass — see High below for why. |
-| H4 (no proxy-level ACLs) | **still open** | Not attempted this pass — see High below for why. |
-| M1 (`AllowSetVar=false` default breaks drivers) | **fixed** | Default flipped to `AllowSetVar=true`; a new `BlockSetVars` denylist (default `["session_authorization", "role"]`) still blocks the two privilege-relevant GUCs regardless. `TestFilter_DefaultAllowsCommonSetVar` checks both halves. |
-| M2 (new knobs undocumented) | **fixed** | `allow_set_var`, `block_set_vars`, `allow_execute`, `on_parse_error` all now appear in `pgproxy.conf` and README.md with their defaults and security implications. |
-| M3 (missing acceptance tests) | **partial** | Added: TxStatus/session-continuation test (H2), cancel-registry-delete test (H1), stop()-drain/force-close test (M5), dial-timeout test (M4), unix-socket stale/live/mode tests (M6). Still missing, as before: extended-protocol (Parse/Bind/Execute/Sync) coverage through the live proxy, `FunctionCall`/`NegotiateProtocolVersion`/COPY/replication-mode sessions, and porting the remaining fixed-port tests to `127.0.0.1:0`. |
-| M4 (no connection limits/timeouts) | **partial** | Backend dials (session startup and CancelRequest forwarding) now use a bounded `backendDialTimeout` (10s) instead of blocking for the OS TCP connect timeout; `TestConnectBackend/dial_timeout` covers it. Still missing: max-connection caps and idle timeouts. |
-| M5 (`stop()` doesn't drain sessions) | **fixed** | `Start` now tracks live sessions in a `sync.Map`; `stop()` waits up to `drainTimeout` (5s) for them to finish, then force-closes any still running by closing their client connection. `TestProxyStop_DrainsAndForceClosesSessions` opens an idle session and confirms `stop()` returns and the client sees the connection close. |
-| M6 (stale unix socket blocks restart; unrestricted socket mode) | **fixed** | `getListener` now removes a stale socket file (one nothing is listening behind) before binding, refuses to touch one something IS listening on, and `chmod`s a newly created socket to `0770`. Three new tests cover stale-removal, not-stealing-a-live-socket, and the mode. |
-| M7 (Handler API has no context) | **still open** | Not attempted this pass — see Medium below for why. |
-| M8 (no metrics/query log/SIGHUP reload) | **still open** | Not attempted this pass — see Medium below for why. |
-| M9 (audit modes may log credentials) | **fixed** | `on_parse_error="audit"`'s log line now runs the raw query text through `redactSecrets` (a `PASSWORD`/`IDENTIFIED BY` literal regex) before logging; documented as best-effort, not exhaustive, in both the code comment and README. `TestRedactSecrets` covers it. |
-| L1 (dead exported constructor) | **fixed** | `proxy.New()` removed (it had no callers); its now-pointless test removed too. |
-| L2 (`readConfig` hard-requires `[DB.master]`) | **fixed** | Now requires only that at least one `[DB.*]` entry exists, under any name. `Test_readConfig_noMasterRequired` and `Test_readConfig_noDatabasesConfigured` cover both halves. |
-| L3 (docs drift) | **fixed** | README's parser claim ("comprehensive, native support") replaced with an explicit list of known unparseable syntax; "Filter scope" section now covers `SET`/`EXECUTE`/`on_parse_error`; `WarnIfFilterConfigIsUnsafe`'s doc comment and message no longer claim a blocked query disconnects the client; `examples/client_example` now uses `dbname=master` matching the shipped `pgproxy.conf`; added a `-version` flag. |
-| L4 (main package has no tests) | **fixed** | `main_test.go` added (drives `-version` through the real `main()`); package coverage is now 100%. |
+| C2 (CockroachDB-derived parser; `on_parse_error=allow` bypass) | **fixed** | Parser replaced: `parser/filter.go` now uses `github.com/pganalyze/pg_query_go/v6`, a Go binding of `libpg_query` - PostgreSQL's *actual* parser, not a reimplementation. Every previously-failing statement family (`COPY`, `LISTEN`, `DELETE...USING`, `MERGE`, `VACUUM`, `DO`, `CALL`, cursors, `GENERATED ALWAYS AS IDENTITY`, full-text `@@`, `SET SESSION AUTHORIZATION <value>`) now parses; `TestFilter_RealPostgreSQLGrammarParses` covers all of them. **Trade-off, disclosed and accepted by the user**: `pg_query_go` uses cgo, so it is not pure Go as the 3rd-pass review assumed. This means (a) `CGO_ENABLED=0` silently drops the parser's functions rather than failing loudly, and (b) cross-compiling to Windows needs a mingw-w64 toolchain - both now documented in AGENTS.md's new "Cgo dependency" section and README's "SQL Support". `extractStatements`' reflection walk (C1, kept from the 4th pass) was ported to walk `pgquery.Node`'s protobuf oneof instead of the old `tree.Statement` interface - same generic-walk approach, new node shape. Signature-based filtering's format changed (real `$1`/`$2` placeholders via `pgquery.Normalize`, not the old `(col = _)` style) - a breaking change for anyone with existing `block_signatures`/`allow_signatures`, called out loudly in README. |
+| H3 (frontend TLS) | **fixed** | `readStartupMessage` now accepts an optional `*tls.Config`: with one configured (`proxy.WithTLS`, built via the new `proxy.NewFrontendTLSConfig(cert, key, clientCA)`), SSLRequest gets `'S'` and the connection is upgraded (with optional mutual TLS via `clientCA`) instead of always `'N'`. `TestReadStartupMessage/SSLRequest_is_accepted...` and `TestProxyWithFrontendTLS` (full session through a live proxy) cover it. Wired into `cli`'s TOML config as `[ServerConfig] TLSCert/TLSKey/TLSClientCA`. |
+| H4 (no proxy-level ACLs) | **fixed** | New `proxy.ACL` (`AllowedCIDRs`/`AllowedUsers`/`AllowedDatabases`, each an allowlist) checked via `proxy.WithACL`: source address at accept time, user/database after the StartupMessage is parsed. A rejected session gets a FATAL `ErrorResponse` (`28000` for address, `42501` for user/database) and is closed. `TestProxyACL` covers all three checks plus the all-pass case. Wired into `cli`'s TOML config as `[ACL]`. |
+| M3 (remaining e2e gaps) | **partial** | Added: frontend-TLS session, ACL (all four cases), max-connections (including slot reuse after a session closes), idle-timeout, context-handler, and metrics (connections/rejections/blocked/backend-errors) end-to-end tests, all through a live `Start()` + mock backend. Still missing, as before: extended-protocol (Parse/Bind/Execute/Sync) round trip, `FunctionCall`/`NegotiateProtocolVersion`/COPY/replication-mode sessions. |
+| M4 (no connection limits/timeouts) | **fixed** | `proxy.WithMaxConnections` caps concurrent sessions (a rejection gets SQLSTATE `53300`, matching real PostgreSQL); `proxy.WithIdleTimeout` closes a session that goes too long between client messages (`SetReadDeadline`, reset per message). `TestProxyMaxConnections` and `TestProxyIdleTimeout` cover both, including that a closed session's slot is reusable. Wired into `cli` as `[ServerConfig] MaxConnections/IdleTimeout`. (The dial-timeout half was already fixed in the 4th pass.) |
+| M7 (Handler API has no context) | **fixed** | New `proxy.ContextHandler func(ConnInfo, string) ([]byte, error)` (set via `proxy.WithContextHandler`) receives `ConnInfo{ConnID, User, Database, RemoteAddr}` alongside every query - takes priority over the plain `Handler` when both are set. `TestProxyContextHandler` verifies every field is populated correctly through a real session. Not wired into `cli`'s TOML config (the shipped `QueryFilter.Handler` doesn't need per-connection context), but available to any program using pgproxy as a library - documented in README under "Per-connection context in a handler". |
+| M8 (no metrics, no query log, no SIGHUP reload) | **fixed** | **Metrics**: `proxy.Metrics` (set via `proxy.WithMetrics`) counts total/active connections, ACL/max-connections rejections, blocked queries, and backend connect errors; nil-safe throughout so code that builds a `*Proxy` directly (unit tests) never needs to care. `TestProxyMetrics` verifies every counter against real traffic. Wired into `cli` unconditionally (always collected) with optional periodic INFO-level logging via `[ServerConfig] MetricsLogInterval`. **SIGHUP reload**: `parser.QueryFilter` now stores its config behind an `atomic.Pointer` with a new `UpdateConfig` method (safe to call concurrently with `Filter` - verified under `-race`); `cli.run` re-reads `[Filter]` and calls `UpdateConfig` on SIGHUP, without dropping the listener or any session. Only `[Filter]` reloads this way - `[ServerConfig]`/`[ACL]`/`[DB.*]` still need a restart, documented as such. Systemd unit files gained `ExecReload=/bin/kill -HUP $MAINPID` so `systemctl reload pgproxy` actually works. **Query log**: not added as a separate feature - `ContextHandler` (M7) is the hook for it; a query log is a few lines inside one, and shipping pgproxy's own opinionated log format/rotation was judged lower value than the hook itself. |
+| C1, H1, H2, M1, M2, M5, M6, M9, L1-L4 | **unchanged, still fixed** | Carried over from the 4th pass; re-verified as part of this pass's full regression run, not re-litigated. |
+
+Note on verification process: `TestProxyMaxConnections`/`TestProxyMetrics` each
+hit a genuine, reproducible race the first time they were written - both
+traced to a shared test helper (`waitForListener`) making its own probe
+connection, which legitimately (and correctly) counts against
+`WithMaxConnections`'/metrics' totals just like a real client's connection
+would. Both tests were fixed by baselining against/waiting past that probe
+rather than assuming a connection count of zero; this is called out in case
+it recurs in a future test using the same helper alongside either feature.
 
 ---
 
-## Critical
+## What's left (unchanged from the 4th pass, not attempted here either)
 
-### C2. Parser is still CockroachDB's grammar; `on_parse_error=allow` turns the firewall off for anything it cannot parse
-
-Carried over from the 3rd pass, unresolved. Every statement family listed
-there (`CREATE FUNCTION`, `COPY ... TO STDOUT`, `LISTEN`, `DELETE ... USING`,
-`GENERATED ALWAYS AS IDENTITY`, full-text `@@`, `MERGE`, `VACUUM`, `DO`,
-`CALL`, cursors, `SET SESSION AUTHORIZATION <value>` ...) still fails to
-parse. What changed this pass is scope, not substance: the behavior is now
-fully documented (README "Statements the parser can't handle", pgproxy.conf
-comments) and the one part of the exposure that was silently dangerous - the
-audit log potentially printing a plaintext password - is now redacted
-(M9, best-effort).
-
-This was deliberately not attempted this pass: replacing the parsing engine
-(e.g. with `github.com/pganalyze/pg_query_go`, pure-Go libpg_query bindings)
-touches every call site in `parser/filter.go`, changes what AST types
-`extractStatements`'s reflection walk needs to recognize, and needs its own
-extensive parse-compatibility test matrix against real PostgreSQL grammar.
-Bundling that with the dozen other fixes in this pass would have made each
-harder to verify independently. It remains the single highest-value next
-step - see Suggested fix order.
-
-Acceptance (unchanged from 3rd pass): the statement families listed above
-parse and are correctly classified by the filter with `on_parse_error`
-left at its default (`"block"`), rather than requiring the escape hatch.
-
----
-
-## High
-
-### H3. Frontend TLS still missing
-
-SSLRequest is still answered 'N' (`proxy/auth.go`): `sslmode=require`/
-`verify-*` clients cannot connect, and all client↔proxy traffic is
-plaintext. Not attempted this pass because it is an API-breaking change with
-a large blast radius: `proxy.Start`'s signature would need a TLS config
-parameter, which has ~40 call sites across the test suite plus the three
-`examples/*` programs and `cli.go`, on top of the actual TLS-termination
-logic (wrapping the accepted connection after a client's SSLRequest, which
-happens inside `readStartupMessage` before `Proxy.rconn` even exists) and
-new `[ServerConfig] TLSCert/TLSKey`(+ optional client-CA) config plumbing
-through `cli/utils.go`. That is a proportionate, but sizeable, standalone
-change; see Suggested fix order.
-
-### H4. No proxy-level access control
-
-Anyone reaching the listener can open a session to any configured backend.
-Still missing: client IP/user allowlists, a default backend for unknown
-databases, pattern routing. Not attempted this pass: this needs a config
-schema decision (allowlist shape, whether rules are global or per-`[DB.*]`,
-how a denial is reported) that's a product decision as much as a code
-change, not something to bolt on alongside a dozen other fixes. General-
-purpose deployment blocker; unchanged from the last two passes.
-
----
-
-## Medium
-
-### M3 (remainder). Extended-protocol and less-common message types still untested end-to-end
-
-The mock server still dispatches only `'Q'` and `'X'`. This pass added
-targeted tests for the specific claims made in H1/H2/M4/M5/M6, but did not
-add a general Parse/Bind/Describe/Execute/Sync flow through the live proxy
-(e.g. via `pgx` with a parameterized query), nor coverage for `FunctionCall`
-('F'), `NegotiateProtocolVersion` ('v'), COPY FROM STDIN/TO STDOUT, or
-replication-mode sessions. `handleIncomingConnection`/
-`applyFrontendHandler` already claim to pass these through losslessly
-(per their doc comments) but that claim is still only exercised for `Query`/
-`Parse` in isolation, not as part of a full extended-protocol round trip.
-
-### M4 (remainder). No max-connection caps or idle timeouts
-
-The dial-timeout half of this finding is fixed (see status table). Still
-missing: a cap on concurrent sessions (per-proxy and/or per-`[DB.*]`) and
-idle-session timeouts. A slowloris-style client that completes startup and
-then sends nothing still pins a goroutine and a backend connection
-indefinitely - `stop()` will now clean it up on shutdown (M5), but nothing
-bounds it during normal operation.
-
-### M7. Handler API has no context
-
-`Handler func(query string) ([]byte, error)` still cannot express
-per-user/per-DB rules, carry audit identity, or implement rate limits. Not
-attempted this pass: changing the `Handler` type is a public API break for
-every caller (`cli.go`, all three `examples/*`, every mock/proxy test that
-constructs a handler closure), and the natural fix (a context-aware
-variant carrying `ConnID`/`User`/`Database`/`RemoteAddr`) is exactly the
-kind of change that should land together with whatever consumes that
-context (H4's ACLs, M8's audit log) rather than speculatively ahead of it.
-
-### M8. No metrics, no query log, no SIGHUP reload
-
-Still true: operators get nothing to monitor (connection counts, blocked-
-query counts, per-DB stats) and must restart the process to change filter
-rules. Not attempted this pass: this is a genuinely new feature (metrics
-library/format choice, a structured query-log format, SIGHUP-safe config
-hot-reload without dropping in-flight sessions) rather than a fix to
-existing code, and belongs in its own reviewed change.
-
----
+Nothing from the 4th-pass "still open" list remains except the parts of
+M3/M4 noted above (extended-protocol/COPY/replication test coverage). Every
+Critical/High finding across all five passes is now fixed.
 
 ## What is in good shape
 
-- The C1 fix replaces a hand-maintained, easy-to-miss-a-case AST switch with
-  a generic reflection walk - it is now structurally harder to reintroduce a
-  bypass by adding a new statement/expression shape, since the walk doesn't
-  need to know about it.
-- H1/H2 close out the two correctness bugs left by the H1 fix from the 2nd
-  pass (killing the session was fixed then; the registry leak and the wrong
-  TxStatus were both regressions/gaps introduced by that same fix).
-- M5/M6 bring shutdown and restart behavior to what's expected of a
-  long-running proxy (no leaked sessions on stop, no manual `rm` of a stale
-  socket after a crash).
-- Every fix in this pass ships with a regression test that was confirmed to
-  fail against the pre-fix code, not just pass against the post-fix code.
-- pgx/v5/pgproto3 migration, GSS/SASL relay, client write serialization,
-  SQLSTATE codes, `cli.Main`/`run` split — all still solid, unchanged this
-  pass.
-
-## Suggested fix order
-
-1. C2 (parser replacement, e.g. `pg_query_go`) - the largest remaining item,
-   and the one everything else's filtering guarantees ultimately depend on.
-2. H3 (frontend TLS) and H4 (ACLs) - both are general-purpose-deployment
-   blockers; H3 is more mechanical (TLS termination is a known pattern), H4
-   needs a config-schema decision first.
-3. M3's remaining gap (extended-protocol/COPY/replication tests) - do this
-   before further protocol-path changes, not after.
-4. M4's remaining gap (connection/idle limits) - pairs naturally with H4's
-   ACL work (both are "who gets how much of the proxy" policy).
-5. M7 (handler context) + M8 (metrics/log/reload), landed together since
-   M8's audit log is a direct consumer of M7's context.
+- The real PostgreSQL grammar (C2) removes an entire class of prior
+  findings at the root: every "parser can't handle X" gap from the 1st
+  through 4th passes is gone, not papered over.
+- `extractStatements`' generic-reflection-walk design (introduced for C1)
+  ported cleanly to the new parser's protobuf node shape with no loss of
+  the "finds a bypass regardless of nesting" property - a sign the original
+  design was sound, not parser-specific.
+- H3/H4/M4/M7/M8 all landed through one consistent `proxy.Option`
+  mechanism (`WithTLS`, `WithACL`, `WithMaxConnections`, `WithIdleTimeout`,
+  `WithContextHandler`, `WithMetrics`), added without breaking any of the
+  ~40 existing `proxy.Start(addr, dbs, handler)` call sites across the test
+  suite and examples.
+- Every new feature is wired into the TOML config `cli` actually reads, not
+  left as library-only capabilities nobody using the shipped binary can
+  reach (the one deliberate exception, `ContextHandler`, is documented as
+  such).
+- Metrics/ACL/TLS/connection-limit code is nil-safe by construction
+  (`*Metrics`, `*compiledACL` methods all handle a nil receiver), so a
+  `*Proxy` built directly - as most of the existing unit tests do, bypassing
+  `Start` - never needed to be touched to stay panic-free.

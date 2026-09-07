@@ -7,6 +7,7 @@ Type=notify
 User=postgres
 Group=postgres
 ExecStart=/usr/local/bin/pgproxy -config /etc/pgproxy/pgproxy.conf -logtostderr=true
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 
 # Security hardening

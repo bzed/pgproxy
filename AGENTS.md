@@ -36,9 +36,39 @@ go test -race -count=1 ./...            # race detector; must pass
 go test -coverprofile=/tmp/cover.out ./... && go tool cover -func=/tmp/cover.out
                                         # coverage gate, see Testing section
 
-# Cross-platform build check
-GOOS=windows GOARCH=amd64 go build ./...
+# Cross-platform build check (needs a mingw-w64 cross-compiler - see
+# "Cgo dependency" below; without CC set this fails with
+# "undefined: pgquery.Parse" etc., not a normal build error)
+GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build ./...
 ```
+
+## Cgo dependency (parser/)
+
+`parser/` uses `github.com/pganalyze/pg_query_go/v6`, a cgo binding of
+libpg_query (the real PostgreSQL parser) — this is a deliberate trade
+(REVIEW.md C2): full PostgreSQL grammar coverage in exchange for a cgo
+dependency, made explicitly, not as an implementation oversight. Consequences:
+
+- `CGO_ENABLED=0` does not build `parser/` at all (the cgo-gated symbols
+  disappear, and `pgquery.Parse`/`pgquery.Normalize` are "undefined" — that
+  specific error is the tell that CGO_ENABLED or CC is missing, not a normal
+  break).
+- A native build (`go build ./...` on Linux/macOS/Windows with the host's C
+  toolchain) needs nothing extra: cgo defaults to enabled and cc/clang/MSVC
+  is picked up automatically.
+- Cross-compiling to Windows from Linux/macOS needs a mingw-w64 cross
+  compiler (Debian/Ubuntu: `gcc-mingw-w64-x86-64-posix`, or the
+  `gcc-mingw-w64-x86-64` metapackage which depends on it) and
+  `CC=x86_64-w64-mingw32-gcc CGO_ENABLED=1` as shown above.
+
+## Platform Compatibility
+
+- Code must build and test on Linux, macOS, and Windows.
+- Avoid platform-specific code (e.g. `syscall.Kill` — use `os.Process.Kill`).
+  Unavoidable platform differences go in `*_windows.go`/`*_unix.go` files with
+  build tags.
+- Verify with `GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build ./...`
+  before committing (see "Cgo dependency" above for why CC is required now).
 
 ## Code Quality (clean Go)
 
@@ -146,14 +176,6 @@ hostile.
 - Integration tests connect to localhost:5432 (user=postgres, password=testpass,
   dbname=testdb) and must skip when unavailable.
 
-## Platform Compatibility
-
-- Code must build and test on Linux, macOS, and Windows.
-- Avoid platform-specific code (e.g. `syscall.Kill` — use `os.Process.Kill`).
-  Unavoidable platform differences go in `*_windows.go`/`*_unix.go` files with
-  build tags.
-- Verify with `GOOS=windows GOARCH=amd64 go build ./...` before committing.
-
 ## Dependencies
 
 - `go mod tidy` after any dependency change; go.mod and go.sum are always
@@ -171,7 +193,8 @@ hostile.
 
 ## Definition of Done (check before handing off)
 
-1. `go build ./...` succeeds (plus `GOOS=windows` cross-build).
+1. `go build ./...` succeeds (plus the `GOOS=windows` cross-build with
+   `CC=x86_64-w64-mingw32-gcc` - see "Cgo dependency").
 2. `go vet ./...`, `gofmt -l .`, and `golangci-lint run --config .golangci.yml ./...` are clean.
 3. `go test -race -count=1 ./...` passes.
 4. Package coverage ≥ 85% (`go tool cover -func`).

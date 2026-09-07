@@ -85,7 +85,7 @@ func TestQueryFilterSignatures(t *testing.T) {
 	config.SignatureFilterEnabled = true
 	config.SignatureAllowByDefault = true
 	config.BlockSignatures = []string{
-		"SELECT * FROM users WHERE (id = _) AND (name = _)",
+		"SELECT * FROM users WHERE id = $1 AND name = $2",
 	}
 
 	filter := NewQueryFilter(config)
@@ -151,7 +151,7 @@ func TestFilter_SignatureAuditMode(t *testing.T) {
 	config := DefaultFilterConfig()
 	config.SignatureFilterEnabled = true
 	config.SignatureAuditMode = true
-	config.BlockSignatures = []string{"SELECT * FROM users WHERE (id = _)"}
+	config.BlockSignatures = []string{"SELECT * FROM users WHERE id = $1"}
 
 	filter := NewQueryFilter(config)
 
@@ -242,6 +242,42 @@ func TestFilter_BypassPrevention(t *testing.T) {
 			filter := NewQueryFilter(tt.config())
 			mustFilter(t, filter, tt.query, tt.want)
 		})
+	}
+}
+
+// TestFilter_RealPostgreSQLGrammarParses covers REVIEW.md C2: statement
+// families the previous (CockroachDB-derived) parser could not parse at
+// all - and which therefore silently bypassed every filter rule under
+// on_parse_error="allow"/"audit", or were refused outright under the
+// default "block" - now parse successfully under the real PostgreSQL
+// grammar (pg_query_go/libpg_query), with on_parse_error left at its
+// default ("block"). Most of these statement types have no Allow* rule of
+// their own, so a successful parse is exactly what makes Filter return true
+// (a parse failure would return false instead); the two SET forms double as
+// a check that BlockSetVars now actually sees them, since the old parser
+// could not parse "SET SESSION AUTHORIZATION <value>" at all.
+func TestFilter_RealPostgreSQLGrammarParses(t *testing.T) {
+	filter := NewQueryFilter(DefaultFilterConfig())
+
+	tests := []struct {
+		query string
+		want  bool
+	}{
+		{"COPY foo TO STDOUT", true},
+		{"LISTEN foo", true},
+		{"DELETE FROM a USING b WHERE a.id = b.id", true}, // has a WHERE clause
+		{"MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN DELETE", true},
+		{"VACUUM a", true},
+		{"DO $$ BEGIN END $$", true},
+		{"CALL foo()", true},
+		{"DECLARE c CURSOR FOR SELECT 1", true},
+		{"ALTER TABLE a ADD COLUMN b int GENERATED ALWAYS AS IDENTITY", true},
+		{"SELECT * FROM a WHERE x @@ to_tsquery('y')", true},
+		{"SET SESSION AUTHORIZATION DEFAULT", false}, // now parses AND is caught by BlockSetVars
+		{"SET SESSION AUTHORIZATION 'bob'", false},   // ditto
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) { mustFilter(t, filter, tt.query, tt.want) })
 	}
 }
 
@@ -419,4 +455,42 @@ func TestWarnIfFilterConfigIsUnsafe(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestQueryFilter_UpdateConfig covers REVIEW.md M8: a config swapped in via
+// UpdateConfig takes effect for subsequent Filter calls, and is safe to
+// call concurrently with Filter (as it would be from a SIGHUP handler
+// racing live traffic).
+func TestQueryFilter_UpdateConfig(t *testing.T) {
+	filter := NewQueryFilter(DefaultFilterConfig()) // AllowDelete: true
+
+	mustFilter(t, filter, "delete from a where id = 1", true)
+
+	stricter := DefaultFilterConfig()
+	stricter.AllowDelete = false
+	filter.UpdateConfig(stricter)
+
+	mustFilter(t, filter, "delete from a where id = 1", false)
+}
+
+// TestQueryFilter_UpdateConfig_ConcurrentWithFilter races UpdateConfig
+// against Filter under the race detector: neither must ever see a
+// torn/partial FilterConfig.
+func TestQueryFilter_UpdateConfig_ConcurrentWithFilter(t *testing.T) {
+	filter := NewQueryFilter(DefaultFilterConfig())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			cfg := DefaultFilterConfig()
+			cfg.AllowDelete = i%2 == 0
+			filter.UpdateConfig(cfg)
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		filter.Filter([]byte("delete from a where id = 1"))
+	}
+	<-done
 }

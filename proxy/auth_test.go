@@ -59,7 +59,7 @@ func TestReadStartupMessage(t *testing.T) {
 			_, _ = client.Write(encodeMsg(sm))
 		}()
 
-		msg, err := readStartupMessage(server)
+		msg, _, err := readStartupMessage(server, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -86,13 +86,71 @@ func TestReadStartupMessage(t *testing.T) {
 			_, _ = client.Write(encodeMsg(sm))
 		}()
 
-		msg, err := readStartupMessage(server)
+		msg, _, err := readStartupMessage(server, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if _, ok := msg.(*pgproto3.StartupMessage); !ok {
 			t.Fatalf("got %T, want *pgproto3.StartupMessage", msg)
 		}
+	})
+
+	// TestReadStartupMessage/SSLRequest_is_accepted... covers REVIEW.md H3:
+	// with a TLS config, SSLRequest gets 'S' (not 'N'), the connection is
+	// upgraded, and the StartupMessage that follows is read over the
+	// encrypted connection - the returned conn must be the TLS one, not
+	// the original.
+	t.Run("SSLRequest is accepted and the connection is upgraded when TLS is configured", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+
+		certPEM, keyPEM := generateSelfSignedCert(t, "pgproxy.test")
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			t.Fatalf("failed to load test cert: %v", err)
+		}
+		serverTLSConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(certPEM)
+		clientTLSConfig := &tls.Config{RootCAs: pool, ServerName: "pgproxy.test"}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = client.Write(encodeMsg(&pgproto3.SSLRequest{}))
+			accept := make([]byte, 1)
+			if _, err := io.ReadFull(client, accept); err != nil {
+				t.Errorf("failed to read SSLRequest response: %v", err)
+				return
+			}
+			if accept[0] != 'S' {
+				t.Errorf("SSLRequest response = %q, want 'S'", accept[0])
+				return
+			}
+			tlsClient := tls.Client(client, clientTLSConfig)
+			if err := tlsClient.Handshake(); err != nil {
+				t.Errorf("client TLS handshake failed: %v", err)
+				return
+			}
+			sm := &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "u"}}
+			if _, err := tlsClient.Write(encodeMsg(sm)); err != nil {
+				t.Errorf("failed to write StartupMessage over TLS: %v", err)
+			}
+		}()
+
+		msg, conn, err := readStartupMessage(server, serverTLSConfig)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := msg.(*pgproto3.StartupMessage); !ok {
+			t.Fatalf("got %T, want *pgproto3.StartupMessage", msg)
+		}
+		if _, ok := conn.(*tls.Conn); !ok {
+			t.Fatalf("returned conn is %T, want *tls.Conn (the upgraded connection)", conn)
+		}
+		<-done
 	})
 
 	t.Run("GSSEncRequest is denied then the StartupMessage follows", func(t *testing.T) {
@@ -110,7 +168,7 @@ func TestReadStartupMessage(t *testing.T) {
 			_, _ = client.Write(encodeMsg(sm))
 		}()
 
-		msg, err := readStartupMessage(server)
+		msg, _, err := readStartupMessage(server, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -129,7 +187,7 @@ func TestReadStartupMessage(t *testing.T) {
 			_, _ = client.Write(encodeMsg(cr))
 		}()
 
-		msg, err := readStartupMessage(server)
+		msg, _, err := readStartupMessage(server, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -142,7 +200,7 @@ func TestReadStartupMessage(t *testing.T) {
 		client, server := net.Pipe()
 		client.Close()
 
-		if _, err := readStartupMessage(server); err == nil {
+		if _, _, err := readStartupMessage(server, nil); err == nil {
 			t.Error("expected an error when the client closes without sending a startup packet")
 		}
 	})
@@ -183,6 +241,73 @@ func generateSelfSignedCert(t *testing.T, commonName string) (certPEM, keyPEM []
 	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	return certPEM, keyPEM
+}
+
+// TestNewFrontendTLSConfig covers REVIEW.md H3's config-building helper:
+// the happy path (with and without a client CA), and its error branches
+// (missing/invalid cert, missing/invalid client CA).
+func TestNewFrontendTLSConfig(t *testing.T) {
+	certPEM, keyPEM := generateSelfSignedCert(t, "pgproxy.test")
+	certFile := filepath.Join(t.TempDir(), "cert.pem")
+	keyFile := filepath.Join(t.TempDir(), "key.pem")
+	if err := os.WriteFile(certFile, certPEM, 0644); err != nil {
+		t.Fatalf("failed to write cert file: %v", err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0644); err != nil {
+		t.Fatalf("failed to write key file: %v", err)
+	}
+
+	t.Run("no client CA: cert/key only, no client auth required", func(t *testing.T) {
+		cfg, err := NewFrontendTLSConfig(certFile, keyFile, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.Certificates) != 1 {
+			t.Fatalf("Certificates = %d entries, want 1", len(cfg.Certificates))
+		}
+		if cfg.ClientAuth != tls.NoClientCert {
+			t.Errorf("ClientAuth = %v, want NoClientCert (the zero value) when no client CA is set", cfg.ClientAuth)
+		}
+	})
+
+	t.Run("missing cert file", func(t *testing.T) {
+		if _, err := NewFrontendTLSConfig(filepath.Join(t.TempDir(), "missing.pem"), keyFile, ""); err == nil {
+			t.Error("expected an error for a missing cert file")
+		}
+	})
+
+	t.Run("with a client CA: mutual TLS is required", func(t *testing.T) {
+		caFile := filepath.Join(t.TempDir(), "ca.pem")
+		if err := os.WriteFile(caFile, certPEM, 0644); err != nil {
+			t.Fatalf("failed to write CA file: %v", err)
+		}
+		cfg, err := NewFrontendTLSConfig(certFile, keyFile, caFile)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ClientAuth != tls.RequireAndVerifyClientCert {
+			t.Errorf("ClientAuth = %v, want RequireAndVerifyClientCert", cfg.ClientAuth)
+		}
+		if cfg.ClientCAs == nil {
+			t.Error("ClientCAs was not set")
+		}
+	})
+
+	t.Run("missing client CA file", func(t *testing.T) {
+		if _, err := NewFrontendTLSConfig(certFile, keyFile, filepath.Join(t.TempDir(), "missing-ca.pem")); err == nil {
+			t.Error("expected an error for a missing client CA file")
+		}
+	})
+
+	t.Run("client CA file has no certificates", func(t *testing.T) {
+		bad := filepath.Join(t.TempDir(), "bad-ca.pem")
+		if err := os.WriteFile(bad, []byte("this is not a certificate"), 0644); err != nil {
+			t.Fatalf("failed to write bad CA file: %v", err)
+		}
+		if _, err := NewFrontendTLSConfig(certFile, keyFile, bad); err == nil {
+			t.Error("expected an error for a client CA file with no certificates")
+		}
+	})
 }
 
 // TestBackendTLSConfig covers backendTLSConfig's no-CA (encrypted but
