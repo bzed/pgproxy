@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -171,6 +172,85 @@ func Test_getListener(t *testing.T) {
 func Test_getListener_invalidAddr(t *testing.T) {
 	if _, err := getListener("not a valid address"); err == nil {
 		t.Error("Expected an error for an invalid listen address, got nil")
+	}
+}
+
+// Test_getListener_unixSocketMode covers REVIEW.md M6: the unix socket file
+// must be chmod'd explicitly rather than left at whatever umask produced.
+func Test_getListener_unixSocketMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix sockets are not supported on Windows")
+	}
+	sockPath := filepath.Join(t.TempDir(), "mode.sock")
+
+	l, err := getListener(sockPath)
+	if err != nil {
+		t.Fatalf("getListener failed: %v", err)
+	}
+	defer l.Close()
+
+	fi, err := os.Stat(sockPath)
+	if err != nil {
+		t.Fatalf("stat socket: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o770 {
+		t.Errorf("socket mode = %o, want 0770", got)
+	}
+}
+
+// Test_getListener_removesStaleSocket covers REVIEW.md M6: a leftover
+// socket file from a crashed previous run (nothing listening behind it)
+// must not block a restart.
+func Test_getListener_removesStaleSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix sockets are not supported on Windows")
+	}
+	sockPath := filepath.Join(t.TempDir(), "stale.sock")
+
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	// Simulate a crash: net.UnixListener.Close() normally unlinks the
+	// socket file it created, but a killed process never gets that
+	// chance, leaving the file behind with nothing listening on it.
+	ul := l.(*net.UnixListener)
+	ul.SetUnlinkOnClose(false)
+	ul.Close()
+
+	if _, err := os.Stat(sockPath); err != nil {
+		t.Fatalf("expected the socket file to remain after simulated crash: %v", err)
+	}
+
+	l2, err := getListener(sockPath)
+	if err != nil {
+		t.Fatalf("getListener should remove the stale socket and succeed, got: %v", err)
+	}
+	defer l2.Close()
+}
+
+// Test_getListener_doesNotStealLiveSocket covers REVIEW.md M6's other edge:
+// a socket another process is actually listening on must not be removed
+// out from under it.
+func Test_getListener_doesNotStealLiveSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix sockets are not supported on Windows")
+	}
+	sockPath := filepath.Join(t.TempDir(), "live.sock")
+
+	live, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to create live listener: %v", err)
+	}
+	defer live.Close()
+
+	if _, err := getListener(sockPath); err == nil {
+		t.Error("getListener should refuse to steal a socket with a live listener, got nil error")
+	}
+
+	// The live listener must still be usable afterwards.
+	if _, err := net.Dial("unix", sockPath); err != nil {
+		t.Errorf("live listener no longer reachable after getListener's probe: %v", err)
 	}
 }
 

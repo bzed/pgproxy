@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -117,6 +119,7 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 	defer m.closeWg.Done()
 
 	isStartup := true
+	txStatus := byte('I') // tracks BEGIN/COMMIT/ROLLBACK so RFQ reports real state
 	for {
 		var msgType byte
 		var contentLength int
@@ -219,6 +222,13 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 				}
 			}
 
+			switch strings.ToUpper(strings.TrimSpace(query)) {
+			case "BEGIN":
+				txStatus = 'T'
+			case "COMMIT", "ROLLBACK":
+				txStatus = 'I'
+			}
+
 			// Send RowDescription: 1 field named "id", type int4 (OID 23),
 			// size 4, modifier -1, text format.
 			rdMsg := []byte{
@@ -253,11 +263,11 @@ func (m *MockPgServer) handleConnection(conn net.Conn) {
 			}
 			conn.Write(ccMsg)
 
-			// Send ReadyForQuery
+			// Send ReadyForQuery, reporting the tracked transaction status.
 			rfqMsg := []byte{
 				'Z',        // ReadyForQuery
 				0, 0, 0, 5, // Length
-				'I', // Transaction status (Idle)
+				txStatus,
 			}
 			conn.Write(rfqMsg)
 
@@ -1100,5 +1110,790 @@ func TestProxyForwardsCancelRequest(t *testing.T) {
 	if got[0] != mock.backendPID || got[1] != mock.backendSecret {
 		t.Errorf("Backend received CancelRequest(%d, %d), want (%d, %d)",
 			got[0], got[1], mock.backendPID, mock.backendSecret)
+	}
+}
+
+// TestProxyStop_DrainsAndForceClosesSessions covers REVIEW.md M5: stop()
+// must not just close the listener and leave live sessions running forever.
+// A session sitting idle (no Terminate, nothing to make it exit on its own)
+// must be force-closed once the drain grace period elapses, and stop() must
+// return once that happens rather than hanging indefinitely.
+func TestProxyStop_DrainsAndForceClosesSessions(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Shorten the drain grace period so the test doesn't wait out the real
+	// production value.
+	oldDrainTimeout := drainTimeout
+	drainTimeout = 200 * time.Millisecond
+	defer func() { drainTimeout = oldDrainTimeout }()
+
+	proxyAddr := "127.0.0.1:29100"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	stop, err := Start(proxyAddr, dbs, handler)
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	// Open a session and leave it idle: no query, no Terminate, nothing
+	// that would make its goroutines exit on their own.
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	if err := performMockStartup(conn); err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop() did not return - idle session was not force-closed after the drain timeout")
+	}
+
+	// The client side must observe the connection actually closing.
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Error("expected the client connection to be closed by stop()'s force-close, got no error")
+	}
+}
+
+// performStartupExpectingError sends a StartupMessage with the given
+// parameters and expects the proxy to refuse it with an ErrorResponse
+// (rather than proceeding to AuthOk/BackendKeyData/ReadyForQuery), as
+// happens for an ACL rejection that isn't caught before the client sends
+// anything (REVIEW.md H4).
+func performStartupExpectingError(t *testing.T, conn net.Conn, params map[string]string) *pgproto3.ErrorResponse {
+	t.Helper()
+	sm := &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: params}
+	if _, err := conn.Write(encodeMsg(sm)); err != nil {
+		t.Fatalf("failed to write StartupMessage: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	frontend := pgproto3.NewFrontend(conn, conn)
+	msg, err := frontend.Receive()
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	errResp, ok := msg.(*pgproto3.ErrorResponse)
+	if !ok {
+		t.Fatalf("got %T, want *pgproto3.ErrorResponse", msg)
+	}
+	return errResp
+}
+
+// expectFatalAtConnect reads a single ErrorResponse pgproxy sends before
+// the client has said anything at all - the case for an ACL source-address
+// rejection, which happens at accept() time (REVIEW.md H4).
+func expectFatalAtConnect(t *testing.T, conn net.Conn) *pgproto3.ErrorResponse {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	frontend := pgproto3.NewFrontend(conn, conn)
+	msg, err := frontend.Receive()
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	errResp, ok := msg.(*pgproto3.ErrorResponse)
+	if !ok {
+		t.Fatalf("got %T, want *pgproto3.ErrorResponse", msg)
+	}
+	return errResp
+}
+
+// TestProxyWithFrontendTLS covers REVIEW.md H3 end-to-end through Start:
+// with WithTLS configured, a client's SSLRequest is accepted and the
+// session proceeds entirely over the encrypted connection, all the way
+// through a real query round trip to the (plaintext) mock backend.
+func TestProxyWithFrontendTLS(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	certPEM, keyPEM := generateSelfSignedCert(t, "pgproxy.test")
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("failed to load test cert: %v", err)
+	}
+
+	proxyAddr := "127.0.0.1:29101"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	stop, err := Start(proxyAddr, dbs, handler, WithTLS(&tls.Config{Certificates: []tls.Certificate{tlsCert}}))
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(encodeMsg(&pgproto3.SSLRequest{})); err != nil {
+		t.Fatalf("failed to send SSLRequest: %v", err)
+	}
+	resp := make([]byte, 1)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("failed to read SSLRequest response: %v", err)
+	}
+	if resp[0] != 'S' {
+		t.Fatalf("SSLRequest response = %q, want 'S'", resp[0])
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(certPEM)
+	tlsConn := tls.Client(conn, &tls.Config{RootCAs: pool, ServerName: "pgproxy.test"})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("client TLS handshake failed: %v", err)
+	}
+
+	if err := performMockStartup(tlsConn); err != nil {
+		t.Fatalf("startup over TLS failed: %v", err)
+	}
+
+	if _, err := tlsConn.Write(createMockQueryMessage("SELECT 1")); err != nil {
+		t.Fatalf("failed to send query over TLS: %v", err)
+	}
+	tlsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	if _, err := tlsConn.Read(buf); err != nil {
+		t.Fatalf("failed to read query response over TLS: %v", err)
+	}
+
+	queries := mock.QueriesReceived()
+	if len(queries) != 1 || queries[0] != "SELECT 1" {
+		t.Errorf("Expected mock to receive 'SELECT 1' over the TLS-fronted proxy, got %v", queries)
+	}
+}
+
+// TestProxyACL covers REVIEW.md H4: WithACL's three independent checks
+// (source address, user, database), each rejecting a session that fails it
+// and allowing one that passes all three.
+func TestProxyACL(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+
+	t.Run("rejects a disallowed source address", func(t *testing.T) {
+		proxyAddr := "127.0.0.1:29102"
+		acl := ACL{AllowedCIDRs: []string{"10.0.0.0/8"}} // excludes 127.0.0.1
+		stop, err := Start(proxyAddr, dbs, handler, WithACL(acl))
+		if err != nil {
+			t.Fatalf("Failed to start proxy: %v", err)
+		}
+		defer stop()
+		if !waitForListener(proxyAddr, 2*time.Second) {
+			t.Fatal("proxy did not start listening in time")
+		}
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+
+		errResp := expectFatalAtConnect(t, conn)
+		if errResp.Code != "28000" {
+			t.Errorf("Code = %q, want 28000 (invalid_authorization_specification)", errResp.Code)
+		}
+	})
+
+	t.Run("rejects a disallowed user", func(t *testing.T) {
+		proxyAddr := "127.0.0.1:29103"
+		acl := ACL{AllowedUsers: []string{"alice"}}
+		stop, err := Start(proxyAddr, dbs, handler, WithACL(acl))
+		if err != nil {
+			t.Fatalf("Failed to start proxy: %v", err)
+		}
+		defer stop()
+		if !waitForListener(proxyAddr, 2*time.Second) {
+			t.Fatal("proxy did not start listening in time")
+		}
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+
+		errResp := performStartupExpectingError(t, conn, map[string]string{"user": "mallory", "database": "testdb"})
+		if errResp.Code != "42501" {
+			t.Errorf("Code = %q, want 42501 (insufficient_privilege)", errResp.Code)
+		}
+	})
+
+	t.Run("rejects a disallowed database", func(t *testing.T) {
+		proxyAddr := "127.0.0.1:29104"
+		acl := ACL{AllowedDatabases: []string{"reports"}}
+		stop, err := Start(proxyAddr, dbs, handler, WithACL(acl))
+		if err != nil {
+			t.Fatalf("Failed to start proxy: %v", err)
+		}
+		defer stop()
+		if !waitForListener(proxyAddr, 2*time.Second) {
+			t.Fatal("proxy did not start listening in time")
+		}
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+
+		errResp := performStartupExpectingError(t, conn, map[string]string{"user": "alice", "database": "testdb"})
+		if errResp.Code != "42501" {
+			t.Errorf("Code = %q, want 42501 (insufficient_privilege)", errResp.Code)
+		}
+	})
+
+	t.Run("allows a session matching every configured rule", func(t *testing.T) {
+		proxyAddr := "127.0.0.1:29105"
+		acl := ACL{AllowedCIDRs: []string{"127.0.0.1/32"}, AllowedUsers: []string{"alice"}, AllowedDatabases: []string{"testdb"}}
+		stop, err := Start(proxyAddr, dbs, handler, WithACL(acl))
+		if err != nil {
+			t.Fatalf("Failed to start proxy: %v", err)
+		}
+		defer stop()
+		if !waitForListener(proxyAddr, 2*time.Second) {
+			t.Fatal("proxy did not start listening in time")
+		}
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+
+		sm := &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "alice", "database": "testdb"}}
+		if _, err := conn.Write(encodeMsg(sm)); err != nil {
+			t.Fatalf("failed to write StartupMessage: %v", err)
+		}
+		resp := make([]byte, 9+13+6)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.ReadFull(conn, resp); err != nil {
+			t.Fatalf("expected a normal startup response (AuthOk/BackendKeyData/RFQ), got: %v", err)
+		}
+	})
+}
+
+// TestProxyMaxConnections covers REVIEW.md M4: a connection beyond
+// WithMaxConnections is refused with a FATAL ErrorResponse rather than
+// being serviced, and a slot freed by a closed session can be reused.
+func TestProxyMaxConnections(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	proxyAddr := "127.0.0.1:29106"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	stop, err := Start(proxyAddr, dbs, handler, WithMaxConnections(1))
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+	// waitForListener's own probe connection counts against the limit
+	// until the proxy notices it was dropped without a StartupMessage
+	// (correct behavior - a bare connect legitimately occupies a slot,
+	// the same as real PostgreSQL/pgbouncer) - give it a moment to clear
+	// before consuming the (deliberately tiny) budget below.
+	time.Sleep(100 * time.Millisecond)
+
+	first, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer first.Close()
+	if err := performMockStartup(first); err != nil {
+		t.Fatalf("first session's startup failed: %v", err)
+	}
+
+	second, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer second.Close()
+	errResp := expectFatalAtConnect(t, second)
+	if errResp.Code != "53300" {
+		t.Errorf("Code = %q, want 53300 (too_many_connections)", errResp.Code)
+	}
+
+	// Closing the first session frees its slot for a new one.
+	first.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	third, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer third.Close()
+	if err := performMockStartup(third); err != nil {
+		t.Errorf("expected the freed slot to admit a new session, got: %v", err)
+	}
+}
+
+// TestProxyIdleTimeout covers REVIEW.md M4: a session that completes
+// startup and then sends nothing is closed once WithIdleTimeout elapses.
+func TestProxyIdleTimeout(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	proxyAddr := "127.0.0.1:29107"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	stop, err := Start(proxyAddr, dbs, handler, WithIdleTimeout(200*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	if err := performMockStartup(conn); err != nil {
+		t.Fatalf("startup failed: %v", err)
+	}
+
+	// Send nothing and wait past the idle timeout: the proxy must close
+	// the connection on its own.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Error("expected the idle connection to be closed by the proxy, got no error")
+	}
+}
+
+// TestProxyContextHandler covers REVIEW.md M7: a ContextHandler receives
+// the session's ConnInfo (connection id, user, database, remote address)
+// alongside each query.
+func TestProxyContextHandler(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	var mu sync.Mutex
+	var gotInfo ConnInfo
+	var gotQuery string
+	ctxHandler := func(info ConnInfo, query string) ([]byte, error) {
+		mu.Lock()
+		gotInfo = info
+		gotQuery = query
+		mu.Unlock()
+		return nil, nil
+	}
+
+	proxyAddr := "127.0.0.1:29108"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	stop, err := Start(proxyAddr, dbs, nil, WithContextHandler(ctxHandler))
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	sm := &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "alice", "database": "testdb"}}
+	if _, err := conn.Write(encodeMsg(sm)); err != nil {
+		t.Fatalf("failed to write StartupMessage: %v", err)
+	}
+	resp := make([]byte, 9+13+6)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("startup failed: %v", err)
+	}
+
+	if _, err := conn.Write(createMockQueryMessage("SELECT 1")); err != nil {
+		t.Fatalf("failed to send query: %v", err)
+	}
+	buf := make([]byte, 1024)
+	if _, err := conn.Read(buf); err != nil {
+		t.Fatalf("failed to read query response: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotInfo.User != "alice" {
+		t.Errorf("ConnInfo.User = %q, want %q", gotInfo.User, "alice")
+	}
+	if gotInfo.Database != "testdb" {
+		t.Errorf("ConnInfo.Database = %q, want %q", gotInfo.Database, "testdb")
+	}
+	if gotInfo.ConnID == 0 {
+		t.Error("ConnInfo.ConnID = 0, want a nonzero connection id")
+	}
+	if !strings.HasPrefix(gotInfo.RemoteAddr, "127.0.0.1:") {
+		t.Errorf("ConnInfo.RemoteAddr = %q, want a 127.0.0.1:<port> address", gotInfo.RemoteAddr)
+	}
+	if gotQuery != "SELECT 1" {
+		t.Errorf("query = %q, want %q", gotQuery, "SELECT 1")
+	}
+}
+
+// TestProxyMetrics covers REVIEW.md M8: WithMetrics' counters actually
+// reflect what happened - a normal session's connection/active counts, a
+// blocked query, an ACL rejection, a max-connections rejection, and a
+// backend connect failure.
+func TestProxyMetrics(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	t.Run("total/active connections and blocked queries", func(t *testing.T) {
+		var m Metrics
+		proxyAddr := "127.0.0.1:29109"
+		dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+		handler := func(query string) ([]byte, error) {
+			if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "DELETE") {
+				return nil, fmt.Errorf("DELETE not allowed")
+			}
+			return nil, nil
+		}
+		stop, err := Start(proxyAddr, dbs, handler, WithMetrics(&m))
+		if err != nil {
+			t.Fatalf("Failed to start proxy: %v", err)
+		}
+		defer stop()
+		if !waitForListener(proxyAddr, 2*time.Second) {
+			t.Fatal("proxy did not start listening in time")
+		}
+		// waitForListener's own probe connection counts as one connection
+		// too (correctly - see TestProxyMaxConnections' comment on the
+		// same point); give it a moment to be processed, then baseline
+		// against it instead of assuming 0.
+		time.Sleep(100 * time.Millisecond)
+		baseline := m.Snapshot().TotalConnections
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		if err := performMockStartup(conn); err != nil {
+			t.Fatalf("startup failed: %v", err)
+		}
+
+		if got := m.Snapshot().TotalConnections; got != baseline+1 {
+			t.Errorf("TotalConnections = %d, want %d", got, baseline+1)
+		}
+		if got := m.Snapshot().ActiveConnections; got != 1 {
+			t.Errorf("ActiveConnections = %d, want 1 while the session is open", got)
+		}
+
+		expectBlockedQuery(t, sendQueryFromClient(t, conn, "DELETE FROM users"))
+		if got := m.Snapshot().BlockedQueries; got != 1 {
+			t.Errorf("BlockedQueries = %d, want 1", got)
+		}
+
+		conn.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for m.Snapshot().ActiveConnections != 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := m.Snapshot().ActiveConnections; got != 0 {
+			t.Errorf("ActiveConnections = %d, want 0 after the session closed", got)
+		}
+	})
+
+	t.Run("rejections", func(t *testing.T) {
+		var m Metrics
+		proxyAddr := "127.0.0.1:29110"
+		dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+		acl := ACL{AllowedCIDRs: []string{"10.0.0.0/8"}} // excludes 127.0.0.1
+		stop, err := Start(proxyAddr, dbs, nil, WithMetrics(&m), WithACL(acl))
+		if err != nil {
+			t.Fatalf("Failed to start proxy: %v", err)
+		}
+		defer stop()
+		if !waitForListener(proxyAddr, 2*time.Second) {
+			t.Fatal("proxy did not start listening in time")
+		}
+		// waitForListener's own probe is itself from 127.0.0.1, so it gets
+		// rejected by this same ACL - give it a moment to be processed,
+		// then baseline against that instead of assuming 0 (see the
+		// "total/active connections" subtest above).
+		time.Sleep(100 * time.Millisecond)
+		baseline := m.Snapshot().RejectedByACL
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+		expectFatalAtConnect(t, conn)
+
+		if got := m.Snapshot().RejectedByACL; got != baseline+1 {
+			t.Errorf("RejectedByACL = %d, want %d", got, baseline+1)
+		}
+	})
+
+	t.Run("backend connect errors", func(t *testing.T) {
+		var m Metrics
+		proxyAddr := "127.0.0.1:29111"
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to reserve an address: %v", err)
+		}
+		unreachable := ln.Addr().String()
+		ln.Close() // nothing listens here now
+		dbs := map[string]DBConfig{"testdb": {Addr: unreachable, DBName: "testdb"}}
+		stop, err := Start(proxyAddr, dbs, nil, WithMetrics(&m))
+		if err != nil {
+			t.Fatalf("Failed to start proxy: %v", err)
+		}
+		defer stop()
+		if !waitForListener(proxyAddr, 2*time.Second) {
+			t.Fatal("proxy did not start listening in time")
+		}
+
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer conn.Close()
+		sm := &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "u", "database": "testdb"}}
+		if _, err := conn.Write(encodeMsg(sm)); err != nil {
+			t.Fatalf("failed to write StartupMessage: %v", err)
+		}
+		expectFatalAtConnect(t, conn)
+
+		if got := m.Snapshot().BackendConnectErrors; got != 1 {
+			t.Errorf("BackendConnectErrors = %d, want 1", got)
+		}
+	})
+}
+
+// sendQueryFromClient sends query on conn and returns conn, for chaining
+// into a helper (like expectBlockedQuery) that reads the response.
+func sendQueryFromClient(t *testing.T, conn net.Conn, query string) net.Conn {
+	t.Helper()
+	if _, err := conn.Write(createMockQueryMessage(query)); err != nil {
+		t.Fatalf("failed to send query: %v", err)
+	}
+	return conn
+}
+
+// TestProxyTeardown_DeletesCancelRegistryEntry covers REVIEW.md H1: session
+// teardown must delete exactly the cancelKey{pid,secret} this session
+// registered from BackendKeyData, not a re-derived/differently-typed key.
+// Before the fix, cancelRegistry.Delete(pid-1) was always a no-op against
+// the (pid, secret)-keyed map, so every session leaked one entry forever.
+func TestProxyTeardown_DeletesCancelRegistryEntry(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	proxyAddr := "127.0.0.1:29098"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	handler := func(query string) ([]byte, error) { return nil, nil }
+	stop, err := Start(proxyAddr, dbs, handler)
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	if err := performMockStartup(conn); err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	key := cancelKey{pid: mock.backendPID, secret: [4]byte{byte(mock.backendSecret >> 24), byte(mock.backendSecret >> 16), byte(mock.backendSecret >> 8), byte(mock.backendSecret)}}
+
+	// Give the response-relaying goroutine time to observe BackendKeyData
+	// and register it, then confirm it's actually there before tearing
+	// down (otherwise a later "not found" would be meaningless).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := cancelRegistry.Load(key); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelRegistry never gained an entry for this session")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Close the client side to tear the session down and let cleanup run.
+	conn.Close()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := cancelRegistry.Load(key); !ok {
+			return // deleted, as expected
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelRegistry entry was not deleted on session teardown (H1 leak)")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestProxyBlockedQuery_PreservesTxStatus covers REVIEW.md H2: the synthetic
+// ReadyForQuery the proxy sends after a blocked query must echo the
+// backend's real transaction status, not hardcode 'I' (idle). A client
+// inside BEGIN...<blocked statement> is still in an open transaction on the
+// backend (which never saw the blocked statement), and must be told so.
+// This also covers part of M3: the session must keep serving queries after
+// a block, not just answer once and go silent.
+func TestProxyBlockedQuery_PreservesTxStatus(t *testing.T) {
+	mock, err := NewMockPgServer()
+	if err != nil {
+		t.Fatalf("Failed to create mock: %v", err)
+	}
+	defer mock.Stop()
+	mock.Start()
+	time.Sleep(50 * time.Millisecond)
+
+	// Proxy handler that blocks DELETE, passes everything else through.
+	handler := func(query string) ([]byte, error) {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "DELETE") {
+			return nil, fmt.Errorf("DELETE not allowed")
+		}
+		return nil, nil
+	}
+
+	proxyAddr := "127.0.0.1:29099"
+	dbs := map[string]DBConfig{"testdb": {Addr: "127.0.0.1:" + mock.Port(), DBName: "testdb"}}
+	stop, err := Start(proxyAddr, dbs, handler)
+	if err != nil {
+		t.Fatalf("Failed to start proxy: %v", err)
+	}
+	defer stop()
+	if !waitForListener(proxyAddr, 2*time.Second) {
+		t.Fatal("proxy did not start listening in time")
+	}
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	if err := performMockStartup(conn); err != nil {
+		t.Fatalf("Failed mock startup: %v", err)
+	}
+
+	frontend := pgproto3.NewFrontend(conn, conn)
+	readRFQ := func(t *testing.T) *pgproto3.ReadyForQuery {
+		t.Helper()
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			msg, err := frontend.Receive()
+			if err != nil {
+				t.Fatalf("failed reading from proxy: %v", err)
+			}
+			if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				return rfq
+			}
+			if _, ok := msg.(*pgproto3.ErrorResponse); ok {
+				continue // the blocked query's error, RFQ follows
+			}
+		}
+	}
+
+	// BEGIN opens a real transaction on the backend.
+	if _, err := conn.Write(createMockQueryMessage("BEGIN")); err != nil {
+		t.Fatalf("failed to send BEGIN: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'T' {
+		t.Fatalf("after BEGIN: RFQ TxStatus = %q, want 'T'", rfq.TxStatus)
+	}
+
+	// The blocked DELETE never reaches the backend, but the client is
+	// still inside the transaction it opened above.
+	if _, err := conn.Write(createMockQueryMessage("DELETE FROM users")); err != nil {
+		t.Fatalf("failed to send blocked DELETE: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'T' {
+		t.Fatalf("after blocked DELETE: RFQ TxStatus = %q, want 'T' (backend transaction is still open)", rfq.TxStatus)
+	}
+
+	// The session must still be usable: a following SELECT gets a normal
+	// response (not a dropped connection).
+	if _, err := conn.Write(createMockQueryMessage("SELECT 1")); err != nil {
+		t.Fatalf("failed to send SELECT after blocked query: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'T' {
+		t.Fatalf("after SELECT: RFQ TxStatus = %q, want 'T'", rfq.TxStatus)
+	}
+
+	// COMMIT closes the transaction; TxStatus must go back to 'I'.
+	if _, err := conn.Write(createMockQueryMessage("COMMIT")); err != nil {
+		t.Fatalf("failed to send COMMIT: %v", err)
+	}
+	if rfq := readRFQ(t); rfq.TxStatus != 'I' {
+		t.Fatalf("after COMMIT: RFQ TxStatus = %q, want 'I'", rfq.TxStatus)
 	}
 }

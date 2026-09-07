@@ -29,6 +29,35 @@ type DBConfig struct {
 	TLSServerName string
 }
 
+// NewFrontendTLSConfig builds the tls.Config used to terminate TLS on the
+// client-facing listener (REVIEW.md H3), for use with WithTLS. certFile/
+// keyFile are a PEM certificate and private key. If clientCAFile is
+// non-empty, client certificate authentication is required (mutual TLS):
+// the client must present a certificate signed by a CA in that file, or the
+// handshake fails.
+func NewFrontendTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("loading TLS certificate/key: %w", err)
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	if clientCAFile != "" {
+		pem, err := os.ReadFile(clientCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading TLS client CA %q: %w", clientCAFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificates found in TLS client CA %q", clientCAFile)
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return cfg, nil
+}
+
 // backendTarget describes how to reach a specific backend: network ("tcp" or
 // "unix") plus the dial address. It is also used to forward CancelRequests
 // directly to the backend a session was talking to.
@@ -51,28 +80,52 @@ func targetFor(addr string) backendTarget {
 // readStartupMessage reads the initial packet(s) from the client using
 // pgproto3's own startup framing (Backend.ReceiveStartupMessage), which
 // natively understands StartupMessage, SSLRequest, GSSEncRequest and
-// CancelRequest. SSLRequest and GSSEncRequest are denied ('N') since the
-// proxy does not (yet) terminate TLS/GSS on the client side; the loop then
-// continues to read the StartupMessage or CancelRequest that follows.
+// CancelRequest.
+//
+// If tlsConfig is non-nil, an SSLRequest is accepted ('S') and conn is
+// upgraded to TLS (REVIEW.md H3) before the loop continues to read the
+// StartupMessage or CancelRequest that follows over the encrypted
+// connection; the returned conn is then the TLS-wrapped one, and the caller
+// must use it (not the original) for the rest of the session. If tlsConfig
+// is nil, SSLRequest is denied ('N') exactly as before. GSSEncRequest is
+// always denied - the proxy does not terminate GSS encryption on the client
+// side.
 //
 // The returned message is either *pgproto3.StartupMessage or
 // *pgproto3.CancelRequest.
-func readStartupMessage(conn net.Conn) (pgproto3.FrontendMessage, error) {
+func readStartupMessage(conn net.Conn, tlsConfig *tls.Config) (pgproto3.FrontendMessage, net.Conn, error) {
 	backend := pgproto3.NewBackend(conn, conn)
 	for {
 		msg, err := backend.ReceiveStartupMessage()
 		if err != nil {
-			return nil, err
+			return nil, conn, err
 		}
 
 		switch msg.(type) {
-		case *pgproto3.SSLRequest, *pgproto3.GSSEncRequest:
+		case *pgproto3.SSLRequest:
+			if tlsConfig == nil {
+				if _, err := conn.Write([]byte{'N'}); err != nil {
+					return nil, conn, err
+				}
+				continue
+			}
+			if _, err := conn.Write([]byte{'S'}); err != nil {
+				return nil, conn, err
+			}
+			tlsConn := tls.Server(conn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				return nil, conn, fmt.Errorf("client TLS handshake failed: %w", err)
+			}
+			conn = tlsConn
+			backend = pgproto3.NewBackend(conn, conn)
+			continue
+		case *pgproto3.GSSEncRequest:
 			if _, err := conn.Write([]byte{'N'}); err != nil {
-				return nil, err
+				return nil, conn, err
 			}
 			continue
 		default:
-			return msg, nil
+			return msg, conn, nil
 		}
 	}
 }
@@ -141,7 +194,7 @@ func backendTLSConfig(db DBConfig, dialAddr string) (*tls.Config, error) {
 func connectBackend(db DBConfig, sm *pgproto3.StartupMessage) (net.Conn, backendTarget, error) {
 	target := targetFor(db.Addr)
 
-	conn, err := net.Dial(target.network, target.addr)
+	conn, err := net.DialTimeout(target.network, target.addr, backendDialTimeout)
 	if err != nil {
 		return nil, target, err
 	}

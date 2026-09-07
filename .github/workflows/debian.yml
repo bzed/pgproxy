@@ -27,7 +27,11 @@ jobs:
 
       - name: Install packaging dependencies
         run: |
-          apt-get install -y debhelper devscripts dpkg-dev golang-any
+          # build-essential (gcc + libc6-dev) is required since parser/ uses
+          # cgo (github.com/pganalyze/pg_query_go) - see AGENTS.md "Cgo
+          # dependency". debian:stable-slim, unlike a real buildd chroot,
+          # does not include it by default.
+          apt-get install -y debhelper devscripts dpkg-dev golang-any build-essential
 
       - name: Build Debian package
         run: |

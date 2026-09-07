@@ -8,7 +8,10 @@ import (
 )
 
 func main() {
-	db, err := sqlx.Open("postgres", "host=127.0.0.1 port=9090 user=postgres password=postgres dbname=db sslmode=disable")
+	// dbname must match a [DB.*] key in pgproxy.conf (pgproxy routes on the
+	// StartupMessage's "database" parameter, not a real backend database
+	// name) - "master" here matches the shipped pgproxy.conf's [DB.master].
+	db, err := sqlx.Open("postgres", "host=127.0.0.1 port=9090 user=postgres password=postgres dbname=master sslmode=disable")
 	if err != nil {
 		fmt.Println(err)
 	}
